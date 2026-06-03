@@ -1,0 +1,939 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI自动化测试平台</title>
+    <link rel="stylesheet" href="https://unpkg.com/element-plus/dist/index.css">
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <script src="https://unpkg.com/element-plus"></script>
+    <script src="https://unpkg.com/axios/dist/axios.min.js"></script>
+    <style>
+        .el-dialog__body { padding: 20px; }
+        .el-form-item { margin-bottom: 18px; }
+        .el-button + .el-button { margin-left: 5px; }
+        .batch-task-table { margin-top: 15px; }
+        .preview-textarea { max-height: 300px; }
+    </style>
+</head>
+<body>
+    <div id="app">
+        <el-container style="height: 100vh;">
+            <el-header style="background: linear-gradient(90deg, #409EFF, #67C23A); color: white; font-size: 22px; padding: 0 20px; display: flex; align-items: center; justify-content: space-between;">
+                <div>🤖 AI自动化测试平台</div>
+                <el-tag type="success" size="large">AI已启用</el-tag>
+            </el-header>
+            <el-main style="padding: 20px;">
+                <el-row :gutter="20">
+                    <el-col :span="12">
+                        <el-card header="📋 测试用例列表" style="height: 100%;">
+                            <div style="margin-bottom: 15px; display: flex; gap: 10px; flex-wrap: wrap;">
+                                <el-button type="primary" @click="showCreateDialog">➕ 新建测试用例</el-button>
+                                <el-button type="success" icon="magic" @click="showAutoGenDialog">🧪 AI生成多场景用例</el-button>
+                                <el-button type="warning" icon="document" @click="showDocGenDialog">📄 文档解析生成</el-button>
+                                <el-button type="info" icon="search" @click="showExploratoryDialog">🔍 探索性生成</el-button>
+                                <el-button type="primary" @click="showRecordDialog">🎥 开始录制</el-button>
+                                <el-button type="success" @click="batchRun" :disabled="selectedCases.length === 0">
+                                    🚀 批量运行 ({{ selectedCases.length }})
+                                </el-button>
+                            </div>
+                            <el-table
+                                :data="testCases"
+                                border
+                                stripe
+                                style="width: 100%;"
+                                @selection-change="handleSelectionChange">
+                                <el-table-column type="selection" width="55"></el-table-column>
+                                <el-table-column prop="id" label="ID" width="80"></el-table-column>
+                                <el-table-column prop="name" label="用例名称"></el-table-column>
+                                <el-table-column prop="test_type" label="类型" width="100"></el-table-column>
+                                <el-table-column label="操作" width="320">
+                                    <template #default="scope">
+                                        <el-button size="small" type="success" @click="runTestCase(scope.row.id)">▶️ 运行</el-button>
+                                        <el-button size="small" type="info" @click="viewTestCase(scope.row)">👁️ 查看</el-button>
+                                        <el-button size="small" type="warning" @click="editTestCase(scope.row)">✏️ 编辑</el-button>
+                                        <el-button size="small" type="danger" @click="deleteTestCase(scope.row)">🗑️ 删除</el-button>
+                                    </template>
+                                </el-table-column>
+                            </el-table>
+                        </el-card>
+                    </el-col>
+                    <el-col :span="12">
+                        <el-card header="📊 测试任务状态" style="height: 100%;">
+                            <el-form :model="taskQuery" inline style="margin-bottom: 15px;">
+                                <el-form-item label="任务ID">
+                                    <el-input v-model="taskQuery.task_id" style="width: 150px;"></el-input>
+                                </el-form-item>
+                                <el-form-item>
+                                    <el-button type="primary" @click="queryTask">🔍 查询</el-button>
+                                </el-form-item>
+                            </el-form>
+                            <el-descriptions :column="1" border v-if="currentTask" style="margin-top: 20px;">
+                                <el-descriptions-item label="任务ID">{{ currentTask.id }}</el-descriptions-item>
+                                <el-descriptions-item label="用例ID">{{ currentTask.case_id }}</el-descriptions-item>
+                                <el-descriptions-item label="执行状态">
+                                    <el-tag :type="currentTask.status === 'success' ? 'success' : currentTask.status === 'failed' ? 'danger' : 'warning'">
+                                        {{ currentTask.status }}
+                                    </el-tag>
+                                </el-descriptions-item>
+                                <el-descriptions-item label="执行结果">
+                                    <pre style="white-space: pre-wrap; word-break: break-all; max-height: 200px; overflow-y: auto;">{{ currentTask.result }}</pre>
+                                </el-descriptions-item>
+                                <el-descriptions-item label="创建时间">{{ currentTask.created_at }}</el-descriptions-item>
+                                <el-descriptions-item label="完成时间">{{ currentTask.finished_at || '执行中...' }}</el-descriptions-item>
+                            </el-descriptions>
+                            <el-empty description="请输入任务ID查询执行状态" v-else-if="!batchTaskIds.length" style="margin-top: 50px;"></el-empty>
+
+                            <div v-if="batchTaskIds.length" class="batch-task-table">
+                                <el-divider content-position="left">🚀 批量执行任务 ({{ batchTaskIds.length }})</el-divider>
+                                <el-table :data="batchTasks" border stripe size="small" max-height="300">
+                                    <el-table-column prop="id" label="任务ID" width="80"></el-table-column>
+                                    <el-table-column prop="case_id" label="用例ID" width="80"></el-table-column>
+                                    <el-table-column prop="status" label="状态" width="100">
+                                        <template #default="scope">
+                                            <el-tag :type="statusTag(scope.row.status)" size="small">{{ scope.row.status }}</el-tag>
+                                        </template>
+                                    </el-table-column>
+                                    <el-table-column prop="result" label="简要结果" show-overflow-tooltip></el-table-column>
+                                </el-table>
+                                <div style="margin-top: 10px; text-align: center;">
+                                    <el-button type="primary" size="small" @click="stopBatchPolling" v-if="batchPolling">停止刷新</el-button>
+                                    <span v-if="batchPolling" style="margin-left: 10px; color: #409EFF;">⏳ 自动刷新中...</span>
+                                </div>
+                            </div>
+                        </el-card>
+                    </el-col>
+                </el-row>
+            </el-main>
+        </el-container>
+
+        <!-- 新建/编辑用例对话框 -->
+        <el-dialog v-model="createDialogVisible" :title="isEdit ? '编辑测试用例' : '新建AI测试用例'" width="700px">
+            <el-form :model="newCase" label-width="100px">
+                <el-form-item label="用例名称" required>
+                    <el-input v-model="newCase.name" placeholder="请输入用例名称" style="width: 100%;"></el-input>
+                </el-form-item>
+                <el-form-item label="测试URL" required>
+                    <el-input v-model="newCase.url" placeholder="例如：https://www.baidu.com" style="width: 100%;"></el-input>
+                </el-form-item>
+                <el-form-item label="AI生成测试步骤">
+                    <div style="display: flex; gap: 10px; align-items: center;">
+                        <el-input v-model="aiRequirement" placeholder="用自然语言描述你要测试的功能..." style="flex: 1;"></el-input>
+                        <el-button type="success" @click="aiGenerateSteps" :loading="aiGenerating" style="width: 120px; flex-shrink: 0;">🤖 AI生成步骤</el-button>
+                    </div>
+                </el-form-item>
+                <el-form-item label="测试步骤" required>
+                    <el-input v-model="newCase.steps" type="textarea" rows="12" placeholder='JSON格式的测试步骤...' style="width: 100%;"></el-input>
+                </el-form-item>
+                <el-form-item label="AI辅助生成定位器">
+                    <div style="display: flex; gap: 10px; align-items: center;">
+                        <el-input v-model="aiElementDesc" placeholder="描述元素，例如：搜索输入框" style="flex: 1;"></el-input>
+                        <el-button type="primary" @click="aiGenerateLocator" :loading="aiLocating" style="width: 120px; flex-shrink: 0;">🔍 生成定位器</el-button>
+                        <el-input v-model="aiGeneratedLocator" placeholder="生成的定位器" style="flex: 1.5;"></el-input>
+                    </div>
+                </el-form-item>
+            </el-form>
+            <template #footer>
+                <el-button @click="createDialogVisible = false; resetForm()">取消</el-button>
+                <el-button type="primary" @click="submitTestCase">确定{{ isEdit ? '修改' : '创建' }}</el-button>
+            </template>
+        </el-dialog>
+
+        <!-- AI 多场景用例生成弹窗 -->
+        <el-dialog v-model="autoGenDialogVisible" title="🧪 AI 批量生成多场景测试用例" width="750px">
+            <el-form :model="autoGenForm" label-width="90px">
+                <el-form-item label="测试URL" required>
+                    <el-input v-model="autoGenForm.url" placeholder="请输入被测页面完整URL" style="width: 100%;"></el-input>
+                </el-form-item>
+                <el-form-item label="业务需求" required>
+                    <el-input v-model="autoGenForm.requirement" type="textarea" rows="6" placeholder="详细描述测试需求、页面功能、字段规则、校验逻辑等" style="width: 100%;"></el-input>
+                </el-form-item>
+                <el-form-item label="生成结果预览" v-if="autoGenPreview">
+                    <el-input v-model="autoGenPreview" type="textarea" readonly class="preview-textarea" placeholder="生成的多场景用例JSON预览..." style="width: 100%;"></el-input>
+                </el-form-item>
+            </el-form>
+            <template #footer>
+                <el-button @click="autoGenDialogVisible = false; resetAutoGenForm()">关闭</el-button>
+                <el-button type="info" @click="previewGenCases" :loading="autoGenLoading">👁️ 预览生成</el-button>
+                <el-button type="success" @click="genAndSaveCases" :loading="autoGenLoading">💾 生成并入库</el-button>
+            </template>
+        </el-dialog>
+
+        <!-- 浏览器录制功能弹窗 -->
+        <el-dialog v-model="recordDialogVisible" title="🎥 浏览器操作录制" width="600px">
+            <el-form :model="recordForm" label-width="90px">
+                <el-form-item label="录制URL" required>
+                    <el-input v-model="recordForm.url" placeholder="请输入要录制的页面URL" style="width: 100%;"></el-input>
+                </el-form-item>
+                <el-form-item label="录制状态">
+                    <el-tag :type="recordStatus === 'idle' ? 'info' : recordStatus === 'recording' ? 'danger' : 'success'">
+                        {{ recordStatus === 'idle' ? '未开始' : recordStatus === 'recording' ? '录制中...' : '录制完成' }}
+                    </el-tag>
+                </el-form-item>
+                <el-form-item label="录制步骤预览" v-if="recordSteps.length">
+                    <el-input v-model="recordStepsText" type="textarea" readonly rows="8" placeholder="录制的步骤将显示在这里..." style="width: 100%;"></el-input>
+                </el-form-item>
+            </el-form>
+            <template #footer>
+                <el-button @click="closeRecordDialog">取消</el-button>
+                <el-button type="danger" @click="startRecord" :loading="recordLoading" v-if="recordStatus === 'idle'">▶️ 开始录制</el-button>
+                <el-button type="success" @click="stopRecord" :loading="recordLoading" v-if="recordStatus === 'recording'">⏹️ 停止录制</el-button>
+                <el-button type="primary" @click="fillRecordSteps" v-if="recordStatus === 'stopped'">📝 回填到用例</el-button>
+            </template>
+        </el-dialog>
+
+        <!-- 文档解析生成弹窗 -->
+        <el-dialog v-model="docGenDialogVisible" title="📄 文档解析生成测试用例" width="750px">
+            <el-form :model="docGenForm" label-width="100px">
+                <el-form-item label="文档类型" required>
+                    <el-select v-model="docGenForm.doc_type" style="width: 100%;">
+                        <el-option label="PRD/需求文档" value="prd"></el-option>
+                        <el-option label="用户故事" value="user_story"></el-option>
+                        <el-option label="接口文档/Swagger" value="api_doc"></el-option>
+                        <el-option label="网页原型（墨刀/Axure等）" value="web_prototype"></el-option>
+                    </el-select>
+                </el-form-item>
+                <el-form-item label="目标URL">
+                    <el-input v-model="docGenForm.url" placeholder="被测页面URL（选填）" style="width: 100%;"></el-input>
+                </el-form-item>
+                <el-form-item>
+                    <el-alert type="info" :closable="false" show-icon>
+                        <template #title>
+                            支持三种方式导入：① 上传文档文件 ② 粘贴文档内容 ③ 粘贴网页/原型链接（自动抓取页面内容）
+                        </template>
+                    </el-alert>
+                </el-form-item>
+                <el-form-item label="网页/原型链接">
+                    <el-input v-model="docGenForm.source_url" placeholder="粘贴墨刀/Axure原型链接或网页URL，自动抓取页面内容生成用例" style="width: 100%;">
+                        <template #prefix>🔗</template>
+                    </el-input>
+                </el-form-item>
+                <el-collapse style="margin-bottom: 10px;">
+                    <el-collapse-item title="🔐 网页需要登录？（高级选项）" name="login">
+                        <el-alert type="info" :closable="false" show-icon style="margin-bottom: 10px;">
+                            <template #title>
+                                如果原型/网页需要登录才能访问，请填写登录信息
+                            </template>
+                        </el-alert>
+                        <el-form-item label="登录URL">
+                            <el-input v-model="docGenForm.login_url" placeholder="登录页面URL（通常与目标URL相同域名）" style="width: 100%;"></el-input>
+                        </el-form-item>
+                        <el-form-item label="用户名">
+                            <el-input v-model="docGenForm.login_username" placeholder="登录用户名/手机号" style="width: 100%;"></el-input>
+                        </el-form-item>
+                        <el-form-item label="密码">
+                            <el-input v-model="docGenForm.login_password" type="password" placeholder="登录密码" style="width: 100%;"></el-input>
+                        </el-form-item>
+                    </el-collapse-item>
+                </el-collapse>
+                <el-divider content-position="left">📁 文档上传</el-divider>
+                <el-form-item label="上传文档">
+                    <el-upload
+                        ref="docUploadRef"
+                        :auto-upload="false"
+                        :limit="1"
+                        :on-change="handleDocFileChange"
+                        :on-remove="handleDocFileRemove"
+                        :file-list="docFileList"
+                        accept=".txt,.md,.markdown,.docx,.pdf,.json,.yaml,.yml"
+                        drag
+                        style="width: 100%;">
+                        <div style="padding: 20px 0;">
+                            <el-icon style="font-size: 32px; color: #409EFF;">📁</el-icon>
+                            <div style="margin-top: 8px; color: #606266;">
+                                拖拽文档到此处，或 <em>点击上传</em>
+                            </div>
+                            <div style="font-size: 12px; color: #999; margin-top: 4px;">
+                                支持 TXT / MD / DOCX / PDF / JSON / YAML
+                            </div>
+                        </div>
+                    </el-upload>
+                </el-form-item>
+                <el-form-item label="文档内容">
+                    <el-input v-model="docGenForm.document_text" type="textarea" rows="8" placeholder="或直接粘贴文档内容..." style="width: 100%;"></el-input>
+                </el-form-item>
+                <el-form-item label="生成结果预览" v-if="docGenPreview">
+                    <el-input v-model="docGenPreview" type="textarea" readonly class="preview-textarea" placeholder="生成的用例JSON预览..." style="width: 100%;"></el-input>
+                </el-form-item>
+            </el-form>
+            <template #footer>
+                <el-button @click="docGenDialogVisible = false; resetDocGenForm()">关闭</el-button>
+                <el-button type="info" @click="previewDocGenCases" :loading="docGenLoading">👁️ 预览生成</el-button>
+                <el-button type="success" @click="docGenAndSaveCases" :loading="docGenLoading">💾 生成并入库</el-button>
+            </template>
+        </el-dialog>
+
+        <!-- 探索性生成弹窗 -->
+        <el-dialog v-model="exploratoryDialogVisible" title="🔍 探索性页面遍历生成用例" width="750px">
+            <el-form :model="exploratoryForm" label-width="100px">
+                <el-form-item label="目标URL" required>
+                    <el-input v-model="exploratoryForm.url" placeholder="请输入要探索的页面完整URL" style="width: 100%;"></el-input>
+                </el-form-item>
+                <el-form-item>
+                    <el-alert type="info" :closable="false" show-icon>
+                        <template #title>
+                            AI将自动打开页面，遍历所有可交互元素（按钮、输入框、下拉框、表格、菜单等），
+                            推断业务流程并生成全面测试用例。
+                        </template>
+                    </el-alert>
+                </el-form-item>
+                <el-divider content-position="left">🔐 登录配置（目标页面需要登录时填写）</el-divider>
+                <el-form-item label="登录页面URL">
+                    <el-input v-model="exploratoryForm.login_url" placeholder="登录页面地址，如 /login" style="width: 100%;"></el-input>
+                </el-form-item>
+                <el-form-item label="用户名">
+                    <el-input v-model="exploratoryForm.username" placeholder="登录用户名" style="width: 100%;"></el-input>
+                </el-form-item>
+                <el-form-item label="密码">
+                    <el-input v-model="exploratoryForm.password" type="password" placeholder="登录密码" show-password style="width: 100%;"></el-input>
+                </el-form-item>
+                <el-collapse style="width: 100%;">
+                    <el-collapse-item title="高级：自定义选择器（可选）">
+                        <el-form-item label="用户名选择器">
+                            <el-input v-model="exploratoryForm.username_selector" placeholder="如 #username 或 input[name='account']" style="width: 100%;"></el-input>
+                        </el-form-item>
+                        <el-form-item label="密码选择器">
+                            <el-input v-model="exploratoryForm.password_selector" placeholder="如 #password 或 input[type='password']" style="width: 100%;"></el-input>
+                        </el-form-item>
+                        <el-form-item label="提交按钮选择器">
+                            <el-input v-model="exploratoryForm.submit_selector" placeholder="如 .login-btn 或 button[type='submit']" style="width: 100%;"></el-input>
+                        </el-form-item>
+                    </el-collapse-item>
+                </el-collapse>
+                <el-form-item label="生成结果预览" v-if="exploratoryPreview">
+                    <el-input v-model="exploratoryPreview" type="textarea" readonly class="preview-textarea" placeholder="生成的用例JSON预览..." style="width: 100%;"></el-input>
+                </el-form-item>
+            </el-form>
+            <template #footer>
+                <el-button @click="exploratoryDialogVisible = false; resetExploratoryForm()">关闭</el-button>
+                <el-button type="info" @click="previewExploratoryCases" :loading="exploratoryLoading">👁️ 预览生成</el-button>
+                <el-button type="success" @click="exploratoryAndSaveCases" :loading="exploratoryLoading">💾 生成并入库</el-button>
+            </template>
+        </el-dialog>
+    </div>
+
+    <script>
+        const { createApp, ref, onMounted, onBeforeUnmount, computed } = Vue;
+
+        const app = createApp({
+            setup() {
+                // 原有数据
+                const testCases = ref([]);
+                const createDialogVisible = ref(false);
+                const newCase = ref({ name: '', description: '', test_type: 'web', url: '', steps: '' });
+                const isEdit = ref(false);
+                const editingCaseId = ref(null);
+                const currentTask = ref(null);
+                const taskQuery = ref({ task_id: '' });
+                const aiRequirement = ref('');
+                const aiGenerating = ref(false);
+                const aiElementDesc = ref('');
+                const aiLocating = ref(false);
+                const aiGeneratedLocator = ref('');
+
+                // 批量执行
+                const selectedCases = ref([]);
+                const batchTaskIds = ref([]);
+                const batchTasks = ref([]);
+                const batchPolling = ref(false);
+                let batchTimer = null;
+
+                // 多场景生成
+                const autoGenDialogVisible = ref(false);
+                const autoGenLoading = ref(false);
+                const autoGenPreview = ref('');
+                const autoGenForm = ref({ url: '', requirement: '' });
+
+                // 文档解析生成
+                const docGenDialogVisible = ref(false);
+                const docGenLoading = ref(false);
+                const docGenPreview = ref('');
+                const docGenForm = ref({ document_text: '', doc_type: 'prd', url: '', source_url: '', login_url: '', login_username: '', login_password: '' });
+                const docUploadRef = ref(null);
+                const docFileList = ref([]);
+
+                // 探索性生成
+                const exploratoryDialogVisible = ref(false);
+                const exploratoryLoading = ref(false);
+
+
+
+
+
+
+
+
+                const exploratoryPreview = ref('');
+                const exploratoryForm = ref({ url: '', login_url: '', username: '', password: '', username_selector: '', password_selector: '', submit_selector: '' });
+
+                // 录制功能
+                const recordDialogVisible = ref(false);
+                const recordForm = ref({ url: '' });
+                const recordStatus = ref('idle');
+                const recordLoading = ref(false);
+                const recordSteps = ref([]);
+                let ws = null;
+
+                const recordStepsText = computed(() => {
+                    return JSON.stringify(recordSteps.value, null, 2);
+                });
+
+                // 辅助函数：强制关闭 WebSocket
+                const forceCloseWs = () => {
+                    if (ws) {
+                        ws.onopen = null;
+                        ws.onmessage = null;
+                        ws.onerror = null;
+                        ws.close();
+                        ws = null;
+                    }
+                };
+
+                // 表格选择
+                const handleSelectionChange = (selection) => {
+                    selectedCases.value = selection;
+                };
+
+                // 批量运行
+                const batchRun = async () => {
+                    if (selectedCases.value.length === 0) return;
+                    const ids = selectedCases.value.map(c => c.id);
+                    try {
+                        const res = await axios.post('/api/test-cases/batch-run', { case_ids: ids });
+                        const taskIds = res.data.task_ids;
+                        batchTaskIds.value = taskIds;
+                        batchTasks.value = [];
+                        currentTask.value = null;
+                        startBatchPolling();
+                        ElementPlus.ElMessage.success(`✅ 已创建 ${taskIds.length} 个测试任务`);
+                    } catch (e) {
+                        ElementPlus.ElMessage.error('批量执行失败：' + (e.response?.data?.detail || e.message));
+                    }
+                };
+
+                const startBatchPolling = () => {
+                    stopBatchPolling();
+                    batchPolling.value = true;
+                    fetchBatchTasks();
+                    batchTimer = setInterval(fetchBatchTasks, 3000);
+                };
+
+                const stopBatchPolling = () => {
+                    if (batchTimer) {
+                        clearInterval(batchTimer);
+                        batchTimer = null;
+                    }
+                    batchPolling.value = false;
+                };
+
+                const fetchBatchTasks = async () => {
+                    if (batchTaskIds.value.length === 0) { stopBatchPolling(); return; }
+                    try {
+                        const res = await axios.post('/api/test-tasks/batch', { task_ids: batchTaskIds.value });
+                        batchTasks.value = res.data;
+                        if (res.data.every(t => t.status !== 'running')) stopBatchPolling();
+                    } catch (e) {
+                        console.error('查询批量任务状态失败', e);
+                    }
+                };
+
+                const statusTag = (status) => {
+                    if (status === 'success') return 'success';
+                    if (status === 'failed') return 'danger';
+                    return 'warning';
+                };
+
+                const getTestCases = async () => {
+                    try {
+                        const res = await axios.get('/api/test-cases/');
+                        testCases.value = res.data;
+                    } catch (e) {
+                        ElementPlus.ElMessage.error('获取用例列表失败');
+                    }
+                };
+
+                const resetForm = () => {
+                    newCase.value = { name: '', description: '', test_type: 'web', url: '', steps: '' };
+                    aiRequirement.value = '';
+                    aiElementDesc.value = '';
+                    aiGeneratedLocator.value = '';
+                    isEdit.value = false;
+                    editingCaseId.value = null;
+                };
+
+                const editTestCase = (row) => {
+                    isEdit.value = true;
+                    editingCaseId.value = row.id;
+                    newCase.value = {
+                        name: row.name,
+                        description: row.description || '',
+                        test_type: row.test_type,
+                        url: row.url,
+                        steps: row.steps
+                    };
+                    createDialogVisible.value = true;
+                };
+
+                const deleteTestCase = async (row) => {
+                    try {
+                        await ElementPlus.ElMessageBox.confirm('确定要删除这个测试用例吗？', '删除确认', {
+                            confirmButtonText: '确定删除',
+                            cancelButtonText: '取消',
+                            type: 'warning'
+                        });
+                        await axios.delete(`/api/test-cases/${row.id}`);
+                        ElementPlus.ElMessage.success('✅ 删除成功');
+                        getTestCases();
+                    } catch (e) {
+                        if (e !== 'cancel') ElementPlus.ElMessage.error('删除失败');
+                    }
+                };
+
+                const submitTestCase = async () => {
+                    if (!newCase.value.name || !newCase.value.url || !newCase.value.steps) {
+                        ElementPlus.ElMessage.warning('请填写所有必填项');
+                        return;
+                    }
+                    if (typeof newCase.value.steps !== 'string') {
+                        newCase.value.steps = JSON.stringify(newCase.value.steps, null, 2);
+                    } else {
+                        try {
+                            const parsed = JSON.parse(newCase.value.steps);
+                            newCase.value.steps = JSON.stringify(parsed, null, 2);
+                        } catch (e) {
+                            ElementPlus.ElMessage.error('测试步骤格式错误，必须为有效 JSON');
+                            return;
+                        }
+                    }
+                    try {
+                        if (isEdit.value) {
+                            await axios.put(`/api/test-cases/${editingCaseId.value}`, newCase.value);
+                            ElementPlus.ElMessage.success('✅ 用例修改成功！');
+                        } else {
+                            await axios.post('/api/test-cases/', newCase.value);
+                            ElementPlus.ElMessage.success('✅ 测试用例创建成功！');
+                        }
+                        createDialogVisible.value = false;
+                        resetForm();
+                        getTestCases();
+                    } catch (e) {
+                        ElementPlus.ElMessage.error('操作失败：' + (e.response?.data?.detail || e.message));
+                    }
+                };
+
+                const runTestCase = async (caseId) => {
+                    try {
+                        const res = await axios.post(`/api/test-cases/${caseId}/run`);
+                        taskQuery.value.task_id = res.data.id;
+                        ElementPlus.ElMessage.success(`✅ 测试任务已创建，任务ID：${res.data.id}`);
+                        queryTask();
+                    } catch (e) {
+                        ElementPlus.ElMessage.error('启动测试失败：' + e.response.data.detail);
+                    }
+                };
+
+                const queryTask = async () => {
+                    if (!taskQuery.value.task_id) return;
+                    try {
+                        const res = await axios.get(`/api/test-tasks/${taskQuery.value.task_id}`);
+                        currentTask.value = res.data;
+                        batchTaskIds.value = [];
+                        stopBatchPolling();
+                        if (res.data.status === 'running') {
+                            setTimeout(queryTask, 3000);
+                        }
+                    } catch (e) {
+                        ElementPlus.ElMessage.error('查询任务失败：' + e.response.data.detail);
+                    }
+                };
+
+                const aiGenerateSteps = async () => {
+                    if (!newCase.value.url || !aiRequirement.value) {
+                        ElementPlus.ElMessage.warning('请先填写测试URL和测试需求');
+                        return;
+                    }
+                    aiGenerating.value = true;
+                    try {
+                        const res = await axios.post('/api/ai/generate-steps', {
+                            url: newCase.value.url,
+                            requirement: aiRequirement.value
+                        }, { timeout: 120000 });
+                        if (res.data.success) {
+                            newCase.value.steps = JSON.stringify(res.data.steps, null, 4);
+                            ElementPlus.ElMessage.success('✅ 测试步骤生成成功！');
+                        } else {
+                            ElementPlus.ElMessage.error('生成失败：' + res.data.error);
+                        }
+                    } catch (e) {
+                        ElementPlus.ElMessage.error('AI服务调用失败');
+                    } finally {
+                        aiGenerating.value = false;
+                    }
+                };
+
+                const aiGenerateLocator = async () => {
+                    if (!newCase.value.url || !aiElementDesc.value) {
+                        ElementPlus.ElMessage.warning('请先填写测试URL和元素描述');
+                        return;
+                    }
+                    aiLocating.value = true;
+                    try {
+                        const res = await axios.post('/api/ai/generate-locator', {
+                            url: newCase.value.url,
+                            element_description: aiElementDesc.value
+                        }, { timeout: 120000 });
+                        if (res.data.success) {
+                            aiGeneratedLocator.value = res.data.locator;
+                            ElementPlus.ElMessage.success('✅ 定位器生成成功！');
+                        } else {
+                            ElementPlus.ElMessage.error('生成失败：' + res.data.error);
+                        }
+                    } catch (e) {
+                        ElementPlus.ElMessage.error('AI服务调用失败');
+                    } finally {
+                        aiLocating.value = false;
+                    }
+                };
+
+                const showCreateDialog = () => {
+                    resetForm();
+                    createDialogVisible.value = true;
+                };
+
+                const viewTestCase = (row) => {
+                    ElementPlus.ElMessage.info(JSON.stringify(row, null, 2));
+                };
+
+                // 多场景生成方法
+                const showAutoGenDialog = () => {
+                    resetAutoGenForm();
+                    autoGenDialogVisible.value = true;
+                };
+
+                const resetAutoGenForm = () => {
+                    autoGenForm.value = { url: '', requirement: '' };
+                    autoGenPreview.value = '';
+                    autoGenLoading.value = false;
+                };
+
+                const previewGenCases = async () => {
+                    if (!autoGenForm.value.url || !autoGenForm.value.requirement) {
+                        ElementPlus.ElMessage.warning('请填写测试URL和业务需求');
+                        return;
+                    }
+                    autoGenLoading.value = true;
+                    try {
+                        const res = await axios.post('/api/ai/generate-cases', autoGenForm.value, { timeout: 180000 });
+                        if (res.data.success) {
+                            autoGenPreview.value = JSON.stringify(res.data.cases, null, 4);
+                            ElementPlus.ElMessage.success(`✅ 成功生成 ${res.data.count} 个多场景用例`);
+                        }
+                    } catch (e) {
+                        const errMsg = e.response?.data?.detail || e.message || '请求异常';
+                        ElementPlus.ElMessage.error('生成失败：' + errMsg);
+                    } finally {
+                        autoGenLoading.value = false;
+                    }
+                };
+
+                // 文档解析生成方法
+                const showDocGenDialog = () => {
+                    resetDocGenForm();
+                    docGenDialogVisible.value = true;
+                };
+
+                const resetDocGenForm = () => {
+                    docGenForm.value = { document_text: '', doc_type: 'prd', url: '', source_url: '', login_url: '', login_username: '', login_password: '' };
+                    docGenPreview.value = '';
+                    docGenLoading.value = false;
+                    docFileList.value = [];
+                };
+
+                const handleDocFileChange = (file) => {
+                    docFileList.value = [file];
+                    const reader = new FileReader();
+                    reader.onload = (e) => {
+                        docGenForm.value.document_text = e.target.result;
+                    };
+                    reader.readAsText(file.raw);
+                };
+
+                const handleDocFileRemove = () => {
+                    docFileList.value = [];
+                    docGenForm.value.document_text = '';
+                };
+
+                const _getDocGenFormData = () => {
+                    const formData = new FormData();
+                    if (docFileList.value.length > 0 && docFileList.value[0].raw) {
+                        formData.append('file', docFileList.value[0].raw);
+                    }
+                    formData.append('doc_type', docGenForm.value.doc_type);
+                    formData.append('url', docGenForm.value.url || '');
+                    formData.append('save', 'false');
+                    if (docFileList.value.length === 0) {
+                        formData.append('document_text', docGenForm.value.document_text || '');
+                    }
+                    return formData;
+                };
+
+                const previewDocGenCases = async () => {
+                    const hasFile = docFileList.value.length > 0;
+                    const hasText = docGenForm.value.document_text && docGenForm.value.document_text.trim();
+                    const hasUrl = docGenForm.value.source_url && docGenForm.value.source_url.trim();
+                    if (!hasFile && !hasText && !hasUrl) {
+                        ElementPlus.ElMessage.warning('请上传文档、粘贴文档内容或输入网页/原型链接');
+                        return;
+                    }
+                    docGenLoading.value = true;
+                    try {
+                        let res;
+                        if (hasFile) {
+                            const formData = _getDocGenFormData();
+                            res = await axios.post('/api/ai/generate-from-document-upload', formData, {
+                                timeout: 210000,
+                                headers: { 'Content-Type': 'multipart/form-data' }
+                            });
+                        } else {
+                            res = await axios.post('/api/ai/generate-from-document', docGenForm.value, { timeout: 210000 });
+                        }
+                        if (res.data.success) {
+                            docGenPreview.value = JSON.stringify(res.data.cases, null, 4);
+                            ElementPlus.ElMessage.success(`✅ 成功从文档生成 ${res.data.count || res.data.cases.length} 个用例`);
+                        }
+                    } catch (e) {
+                        const errMsg = e.response?.data?.detail || e.message || '请求异常';
+                        ElementPlus.ElMessage.error('文档解析失败：' + errMsg);
+                    } finally {
+                        docGenLoading.value = false;
+                    }
+                };
+
+                const docGenAndSaveCases = async () => {
+                    const hasFile = docFileList.value.length > 0;
+                    const hasText = docGenForm.value.document_text && docGenForm.value.document_text.trim();
+                    const hasUrl = docGenForm.value.source_url && docGenForm.value.source_url.trim();
+                    if (!hasFile && !hasText && !hasUrl) {
+                        ElementPlus.ElMessage.warning('请上传文档、粘贴文档内容或输入网页/原型链接');
+                        return;
+                    }
+                    docGenLoading.value = true;
+                    try {
+                        let res;
+                        if (hasFile) {
+                            const formData = _getDocGenFormData();
+                            formData.set('save', 'true');
+                            res = await axios.post('/api/ai/generate-from-document-upload', formData, {
+                                timeout: 210000,
+                                headers: { 'Content-Type': 'multipart/form-data' }
+                            });
+                        } else {
+                            res = await axios.post('/api/ai/generate-from-document-and-save', docGenForm.value, { timeout: 210000 });
+                        }
+                        if (res.data.success) {
+                            ElementPlus.ElMessage.success(`✅ 成功从文档生成并入库 ${res.data.saved_count} 个测试用例`);
+                            getTestCases();
+                            docGenPreview.value = JSON.stringify(res.data.cases, null, 4);
+                        }
+                    } catch (e) {
+                        const errMsg = e.response?.data?.detail || e.message || '请求异常';
+                        ElementPlus.ElMessage.error('文档解析入库失败：' + errMsg);
+                    } finally {
+                        docGenLoading.value = false;
+                    }
+                };
+
+                // 探索性生成方法
+                const showExploratoryDialog = () => {
+                    resetExploratoryForm();
+                    exploratoryDialogVisible.value = true;
+                };
+
+                const resetExploratoryForm = () => {
+                    exploratoryForm.value = { url: '', login_url: '', username: '', password: '', username_selector: '', password_selector: '', submit_selector: '' };
+                    exploratoryPreview.value = '';
+                    exploratoryLoading.value = false;
+                };
+
+                const previewExploratoryCases = async () => {
+                    if (!exploratoryForm.value.url) {
+                        ElementPlus.ElMessage.warning('请填写目标URL');
+                        return;
+                    }
+                    exploratoryLoading.value = true;
+                    try {
+                        const res = await axios.post('/api/ai/generate-exploratory', exploratoryForm.value, { timeout: 240000 });
+                        if (res.data.success) {
+                            exploratoryPreview.value = JSON.stringify(res.data.cases, null, 4);
+                            ElementPlus.ElMessage.success(`✅ 探索性生成 ${res.data.count} 个用例`);
+                        }
+                    } catch (e) {
+                        const errMsg = e.response?.data?.detail || e.message || '请求异常';
+                        ElementPlus.ElMessage.error('探索性生成失败：' + errMsg);
+                    } finally {
+                        exploratoryLoading.value = false;
+                    }
+                };
+
+                const exploratoryAndSaveCases = async () => {
+                    if (!exploratoryForm.value.url) {
+                        ElementPlus.ElMessage.warning('请填写目标URL');
+                        return;
+                    }
+                    exploratoryLoading.value = true;
+                    try {
+                        const res = await axios.post('/api/ai/generate-exploratory-and-save', exploratoryForm.value, { timeout: 240000 });
+                        if (res.data.success) {
+                            ElementPlus.ElMessage.success(`✅ 探索性生成并入库 ${res.data.saved_count} 个测试用例`);
+                            getTestCases();
+                            exploratoryPreview.value = JSON.stringify(res.data.cases, null, 4);
+                        }
+                    } catch (e) {
+                        const errMsg = e.response?.data?.detail || e.message || '请求异常';
+                        ElementPlus.ElMessage.error('探索性入库失败：' + errMsg);
+                    } finally {
+                        exploratoryLoading.value = false;
+                    }
+                };
+
+                const genAndSaveCases = async () => {
+                    if (!autoGenForm.value.url || !autoGenForm.value.requirement) {
+                        ElementPlus.ElMessage.warning('请填写测试URL和业务需求');
+                        return;
+                    }
+                    autoGenLoading.value = true;
+                    try {
+                        const res = await axios.post('/api/ai/generate-and-save-cases', autoGenForm.value, { timeout: 180000 });
+                        if (res.data.success) {
+                            ElementPlus.ElMessage.success(`✅ 成功生成并入库 ${res.data.saved_count} 个测试用例`);
+                            getTestCases();
+                            autoGenPreview.value = JSON.stringify(res.data.cases, null, 4);
+                        }
+                    } catch (e) {
+                        const errMsg = e.response?.data?.detail || e.message || '请求异常';
+                        ElementPlus.ElMessage.error('生成并入库失败：' + errMsg);
+                    } finally {
+                        autoGenLoading.value = false;
+                    }
+                };
+
+                // ==================== 录制功能修复 ====================
+                const showRecordDialog = () => {
+                    forceCloseWs();                     // 强制清理旧连接
+                    recordForm.value = { url: newCase.value.url || '' };
+                    recordStatus.value = 'idle';
+                    recordSteps.value = [];
+                    recordLoading.value = false;
+                    recordDialogVisible.value = true;
+                };
+
+                const closeRecordDialog = () => {
+                    forceCloseWs();
+                    recordStatus.value = 'idle';
+                    recordDialogVisible.value = false;
+                };
+
+                const startRecord = () => {
+                    if (!recordForm.value.url) {
+                        ElementPlus.ElMessage.warning('请输入录制URL');
+                        return;
+                    }
+                    forceCloseWs();                     // 确保没有任何残留连接
+                    recordLoading.value = true;
+
+                    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                    const wsUrl = `${protocol}//${window.location.host}/ws/record`;
+                    ws = new WebSocket(wsUrl);
+
+                    ws.onopen = () => {
+                        ws.send(JSON.stringify({ action: 'start', url: recordForm.value.url }));
+                        recordStatus.value = 'recording';
+                        recordLoading.value = false;
+                        ElementPlus.ElMessage.success('✅ 已启动浏览器，开始录制操作');
+                    };
+
+                    ws.onmessage = (evt) => {
+                        const data = JSON.parse(evt.data);
+                        if (data.status === 'stopped') {
+                            recordSteps.value = data.steps;
+                            recordStatus.value = 'stopped';
+                            recordLoading.value = false;
+                            forceCloseWs();             // 收到停止响应后关闭连接
+                            ElementPlus.ElMessage.success('✅ 录制完成！');
+                        }
+                    };
+
+                    ws.onerror = () => {
+                        recordLoading.value = false;
+                        forceCloseWs();
+                        ElementPlus.ElMessage.error('❌ 录制连接失败，请检查后端服务');
+                    };
+
+                    ws.onclose = () => {
+                        console.log('WebSocket 已关闭');
+                    };
+                };
+
+                const stopRecord = () => {
+                    if (!ws || ws.readyState !== WebSocket.OPEN) {
+                        ElementPlus.ElMessage.warning('录制未开始或已断开');
+                        return;
+                    }
+                    recordLoading.value = true;
+                    ws.send(JSON.stringify({ action: 'stop' }));
+                };
+
+                const fillRecordSteps = () => {
+                    if (recordSteps.value.length === 0) {
+                        ElementPlus.ElMessage.warning('暂无录制步骤');
+                        return;
+                    }
+                     resetForm();  // 🔥 新增：回填前先清空表单残留数据
+                    newCase.value.steps = JSON.stringify(recordSteps.value, null, 4);
+                    newCase.value.url = recordForm.value.url;
+                    closeRecordDialog();
+                    createDialogVisible.value = true;
+                    ElementPlus.ElMessage.success('✅ 已将录制步骤回填到测试用例！');
+                };
+
+                // 生命周期
+                onMounted(() => {
+                    getTestCases();
+                });
+
+                onBeforeUnmount(() => {
+                    stopBatchPolling();
+                    forceCloseWs();
+                });
+
+                return {
+                    testCases, createDialogVisible, newCase, currentTask, taskQuery,
+                    aiRequirement, aiGenerating, aiElementDesc, aiLocating, aiGeneratedLocator,
+                    isEdit, editingCaseId,
+                    getTestCases, submitTestCase, runTestCase, queryTask, aiGenerateSteps, aiGenerateLocator,
+                    showCreateDialog, viewTestCase, editTestCase, deleteTestCase, resetForm,
+                    selectedCases, batchTaskIds, batchTasks, batchPolling,
+                    handleSelectionChange, batchRun, startBatchPolling, stopBatchPolling,
+                    fetchBatchTasks, statusTag,
+
+                    autoGenDialogVisible, autoGenLoading, autoGenPreview, autoGenForm,
+                    showAutoGenDialog, resetAutoGenForm, previewGenCases, genAndSaveCases,
+
+                    docGenDialogVisible, docGenLoading, docGenPreview, docGenForm,
+                    showDocGenDialog, resetDocGenForm, previewDocGenCases, docGenAndSaveCases,
+                    docUploadRef, docFileList, handleDocFileChange, handleDocFileRemove,
+
+                    exploratoryDialogVisible, exploratoryLoading, exploratoryPreview, exploratoryForm,
+                    showExploratoryDialog, resetExploratoryForm, previewExploratoryCases, exploratoryAndSaveCases,
+
+                    recordDialogVisible, recordForm, recordStatus, recordLoading, recordSteps, recordStepsText,
+                    showRecordDialog, closeRecordDialog, startRecord, stopRecord, fillRecordSteps
+                };
+            }
+        });
+
+        app.use(ElementPlus);
+        app.mount('#app');
+    </script>
+</body>
+</html>
