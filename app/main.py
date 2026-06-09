@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Depends, BackgroundTasks, HTTPException, WebSocket, WebSocketDisconnect, UploadFile, File, Form
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from sqlalchemy.orm import Session
 from . import models, schemas, crud, test_runner, ai_engine
 from .database import engine, get_db
@@ -30,6 +30,11 @@ if not os.path.exists(STATIC_DIR):
     os.makedirs(STATIC_DIR)
     logger.warning(f"已自动创建 {STATIC_DIR} 目录，请将 index.html 等前端资源放入其中")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+ALLURE_REPORT_DIR = "allure-report"
+if not os.path.exists(ALLURE_REPORT_DIR):
+    os.makedirs(ALLURE_REPORT_DIR)
+app.mount("/reports", StaticFiles(directory=ALLURE_REPORT_DIR, html=True), name="reports")
 
 AUTH_STATE_FILE = "auth_state.json"
 
@@ -76,6 +81,7 @@ class AIDocumentGenerateRequest(BaseModel):
     login_username_selector: str = ""
     login_password_selector: str = ""
     login_submit_selector: str = ""
+    manual_login: bool = False
 
 
 class AIExploratoryGenerateRequest(BaseModel):
@@ -86,6 +92,18 @@ class AIExploratoryGenerateRequest(BaseModel):
     username_selector: str = ""
     password_selector: str = ""
     submit_selector: str = ""
+    manual_login: bool = False
+
+
+class ModaoTraverseRequest(BaseModel):
+    url: str
+    manual_login: bool = False
+
+
+class RequirementConfirmRequest(BaseModel):
+    document_text: str
+    doc_type: str = "prd"
+    url: str = ""
 
 
 # ------------------- 测试用例接口 -------------------
@@ -246,34 +264,48 @@ async def api_ai_generate_and_save_cases(request: AIGenerateCasesRequest, db: Se
 
 
 def _save_generated_cases(cases: list, db: Session) -> list:
-    """统一保存AI生成的用例"""
+    """统一保存AI生成的功能测试用例到功能用例表"""
     saved_cases = []
     for case in cases:
         case_id = case.get("id", "")
         case_name = case.get("name", "")
-        display_name = f"{case_id} {case_name}" if case_id else case_name
-
+        module = case.get("module", "")
+        priority = case.get("priority", "P1")
         preconditions = case.get("preconditions", "")
         expected_result = case.get("expected_result", "")
         scenario_type = case.get("scenario_type", "")
+        test_data = case.get("test_data", "")
+        test_steps = case.get("test_steps", case.get("steps", []))
+        source_url = case.get("url", "")
 
-        description_parts = []
-        if scenario_type:
-            description_parts.append(f"【场景类型】{scenario_type}")
-        if preconditions:
-            description_parts.append(f"【前置条件】{preconditions}")
-        if expected_result:
-            description_parts.append(f"【预期结果】{expected_result}")
-        description_parts.append(case.get("description", case_name))
+        # AI可能返回list，需要转为str
+        if isinstance(preconditions, list):
+            preconditions = "\n".join(str(p) for p in preconditions)
+        if isinstance(expected_result, list):
+            expected_result = "\n".join(str(r) for r in expected_result)
+        if isinstance(test_data, list):
+            test_data = "\n".join(str(d) for d in test_data)
+        if not isinstance(test_steps, (list, str)):
+            test_steps = []
+        if isinstance(test_steps, str):
+            try:
+                test_steps = json.loads(test_steps)
+            except (json.JSONDecodeError, TypeError):
+                test_steps = [test_steps]
 
-        case_create = schemas.TestCaseCreate(
-            name=display_name,
-            description="\n".join(description_parts),
-            url=case["url"],
-            test_type=case["test_type"],
-            steps=json.dumps(case["steps"], ensure_ascii=False)
+        func_case = schemas.FunctionalTestCaseCreate(
+            case_id=case_id,
+            name=case_name,
+            module=module,
+            priority=priority,
+            preconditions=str(preconditions),
+            test_steps=json.dumps(test_steps, ensure_ascii=False),
+            expected_result=str(expected_result),
+            test_data=str(test_data),
+            scenario_type=scenario_type,
+            source_url=source_url
         )
-        db_case = crud.create_test_case(db=db, case=case_create)
+        db_case = crud.create_functional_case(db=db, case=func_case)
         saved_cases.append(db_case)
     return saved_cases
 
@@ -287,15 +319,16 @@ async def api_ai_generate_from_document(request: AIDocumentGenerateRequest):
                 run_in_threadpool(ai_engine.fetch_url_content, request.source_url,
                                   request.login_url, request.login_username,
                                   request.login_password, request.login_username_selector,
-                                  request.login_password_selector, request.login_submit_selector),
-                timeout=180.0
+                                  request.login_password_selector, request.login_submit_selector,
+                                  request.manual_login),
+                timeout=300.0
             )
         if not document_text:
             raise HTTPException(status_code=400, detail="请提供文档内容或网页URL")
         cases = await asyncio.wait_for(
             run_in_threadpool(ai_engine.ai_generate_cases_from_document,
                               document_text, request.doc_type, request.url),
-            timeout=180.0
+            timeout=420.0
         )
         return {"success": True, "cases": cases, "count": len(cases)}
     except asyncio.TimeoutError:
@@ -317,15 +350,16 @@ async def api_ai_generate_from_document_and_save(request: AIDocumentGenerateRequ
                 run_in_threadpool(ai_engine.fetch_url_content, request.source_url,
                                   request.login_url, request.login_username,
                                   request.login_password, request.login_username_selector,
-                                  request.login_password_selector, request.login_submit_selector),
-                timeout=180.0
+                                  request.login_password_selector, request.login_submit_selector,
+                                  request.manual_login),
+                timeout=300.0
             )
         if not document_text:
             raise HTTPException(status_code=400, detail="请提供文档内容或网页URL")
         cases = await asyncio.wait_for(
             run_in_threadpool(ai_engine.ai_generate_cases_from_document,
                               document_text, request.doc_type, request.url),
-            timeout=180.0
+            timeout=420.0
         )
         saved_cases = _save_generated_cases(cases, db)
         return {
@@ -361,7 +395,7 @@ async def api_ai_generate_from_document_upload(
         cases = await asyncio.wait_for(
             run_in_threadpool(ai_engine.ai_generate_cases_from_document,
                               document_text, doc_type, url),
-            timeout=180.0
+            timeout=420.0
         )
         if save:
             saved_cases = _save_generated_cases(cases, db)
@@ -404,6 +438,31 @@ async def api_ai_generate_exploratory(request: AIExploratoryGenerateRequest):
         raise HTTPException(status_code=500, detail=f"探索性生成失败：{str(e)}")
 
 
+# 需求分析请求模型
+class AnalyzeRequest(BaseModel):
+    document_text: str
+
+
+@app.post("/api/ai/analyze")
+async def api_ai_analyze(request: AnalyzeRequest):
+    try:
+        analysis = await asyncio.wait_for(
+            run_in_threadpool(ai_engine.analyze_requirement, request.document_text),
+            timeout=420.0
+        )
+        return {
+            "success": True,
+            "analysis": analysis,
+            "message": "需求分析成功"
+        }
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="需求分析超时")
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"需求分析失败：{str(e)}")
+
+
 @app.post("/api/ai/generate-exploratory-and-save")
 async def api_ai_generate_exploratory_and_save(request: AIExploratoryGenerateRequest, db: Session = Depends(get_db)):
     try:
@@ -425,6 +484,80 @@ async def api_ai_generate_exploratory_and_save(request: AIExploratoryGenerateReq
         raise HTTPException(status_code=504, detail="AI探索性生成超时")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"探索性生成并保存失败：{str(e)}")
+
+
+@app.post("/api/ai/modao-traverse")
+async def api_ai_modao_traverse(request: ModaoTraverseRequest):
+    try:
+        traverse_result = await asyncio.wait_for(
+            run_in_threadpool(ai_engine.traverse_modao_pages,
+                              request.url, request.manual_login),
+            timeout=600.0
+        )
+        
+        if not traverse_result["success"]:
+            raise HTTPException(status_code=500, detail=traverse_result.get("error", "遍历失败"))
+        
+        # 调用AI进行需求分析
+        analysis_result = await asyncio.wait_for(
+            run_in_threadpool(ai_engine.analyze_requirement,
+                              traverse_result["all_content"]),
+            timeout=420.0
+        )
+        
+        return {
+            "success": True,
+            "traverse_result": traverse_result,
+            "analysis_result": analysis_result
+        }
+    
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="墨刀遍历或需求分析超时")
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"墨刀遍历或需求分析失败：{str(e)}")
+
+
+@app.post("/api/ai/generate-from-analysis")
+async def api_ai_generate_from_analysis(request: RequirementConfirmRequest):
+    try:
+        cases = await asyncio.wait_for(
+            run_in_threadpool(ai_engine.ai_generate_cases_from_document,
+                              request.document_text, request.doc_type, request.url),
+            timeout=420.0
+        )
+        return {"success": True, "cases": cases, "count": len(cases)}
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="AI从分析生成测试用例超时")
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"从分析生成测试用例失败：{str(e)}")
+
+
+@app.post("/api/ai/generate-from-analysis-and-save")
+async def api_ai_generate_from_analysis_and_save(request: RequirementConfirmRequest, db: Session = Depends(get_db)):
+    try:
+        cases = await asyncio.wait_for(
+            run_in_threadpool(ai_engine.ai_generate_cases_from_document,
+                              request.document_text, request.doc_type, request.url),
+            timeout=420.0
+        )
+        saved_cases = _save_generated_cases(cases, db)
+        return {
+            "success": True,
+            "saved_count": len(saved_cases),
+            "cases": saved_cases,
+            "message": f"成功从需求分析生成并保存{len(saved_cases)}个测试用例"
+        }
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="AI从分析生成测试用例超时")
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"从分析生成测试用例失败：{str(e)}")
+
 
 # ===================== 录制 WebSocket 接口 =====================
 @app.websocket("/ws/record")
@@ -1240,3 +1373,353 @@ async def ai_enhance_recorded_steps(raw_steps: list[dict], url: str = "") -> Tup
     except Exception as e:
         logger.error(f"❌ 步骤清洗失败: {e}")
         return raw_steps, False
+
+
+class ExportRequest(BaseModel):
+    case_ids: List[int] = []
+    format: str = "html"
+
+
+@app.post("/api/export-cases")
+def api_export_cases(request: ExportRequest, db: Session = Depends(get_db)):
+    try:
+        if request.case_ids:
+            cases = []
+            for cid in request.case_ids:
+                c = crud.get_test_case(db, cid)
+                if c:
+                    cases.append(c)
+        else:
+            cases = crud.get_test_cases(db)
+        if not cases:
+            raise HTTPException(status_code=404, detail="没有可导出的用例")
+        if request.format == "html":
+            return Response(
+                content=_build_export_html(cases),
+                media_type="text/html; charset=utf-8",
+                headers={"Content-Disposition": "attachment; filename=test_cases_export.html"}
+            )
+        elif request.format == "excel":
+            return Response(
+                content=_build_export_excel(cases),
+                media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                headers={"Content-Disposition": "attachment; filename=test_cases_export.xlsx"}
+            )
+        else:
+            raise HTTPException(status_code=400, detail=f"不支持的导出格式: {request.format}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"导出失败：{str(e)}")
+
+
+def _build_export_html(cases) -> str:
+    rows = ""
+    for i, case in enumerate(cases, 1):
+        steps = case.steps
+        try:
+            steps_list = json.loads(steps) if isinstance(steps, str) else steps
+        except Exception:
+            steps_list = [steps]
+        if isinstance(steps_list, list):
+            if all(isinstance(s, dict) for s in steps_list):
+                steps_html = "<br>".join(f"{j}. {s.get('description', str(s))}" for j, s in enumerate(steps_list, 1))
+            else:
+                steps_html = "<br>".join(f"{j}. {s}" for j, s in enumerate(steps_list, 1))
+        else:
+            steps_html = str(steps_list)
+        desc = (case.description or "").replace("\n", "<br>")
+        rows += f"""<tr><td>{i}</td><td>{case.name}</td><td>{desc}</td><td>{steps_html}</td><td>{case.url}</td></tr>"""
+    return f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><title>测试用例导出</title>
+<style>body{{font-family:'Microsoft YaHei',sans-serif;padding:20px}}h1{{text-align:center;color:#333}}
+table{{width:100%;border-collapse:collapse;margin-top:20px}}th,td{{border:1px solid #ddd;padding:10px;text-align:left;vertical-align:top}}
+th{{background-color:#409eff;color:white}}tr:nth-child(even){{background-color:#f9f9f9}}</style></head>
+<body><h1>功能测试用例</h1><table><thead><tr><th style="width:50px">序号</th><th style="width:200px">用例名称</th>
+<th style="width:250px">用例信息</th><th>测试步骤</th><th style="width:150px">URL</th></tr></thead><tbody>{rows}</tbody></table></body></html>"""
+
+
+def _build_export_excel(cases) -> bytes:
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+    except ImportError:
+        raise HTTPException(status_code=500, detail="请安装openpyxl: pip install openpyxl")
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "测试用例"
+    header_font = Font(name="微软雅黑", bold=True, color="FFFFFF", size=11)
+    header_fill = PatternFill(start_color="409EFF", end_color="409EFF", fill_type="solid")
+    header_alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    cell_alignment = Alignment(vertical="top", wrap_text=True)
+    thin_border = Border(left=Side(style="thin"), right=Side(style="thin"), top=Side(style="thin"), bottom=Side(style="thin"))
+    headers = ["序号", "用例名称", "用例信息", "测试步骤", "URL"]
+    for col, header in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=col, value=header)
+        cell.font = header_font; cell.fill = header_fill; cell.alignment = header_alignment; cell.border = thin_border
+    ws.column_dimensions['A'].width = 6; ws.column_dimensions['B'].width = 30; ws.column_dimensions['C'].width = 40
+    ws.column_dimensions['D'].width = 50; ws.column_dimensions['E'].width = 30
+    for i, case in enumerate(cases, 1):
+        steps = case.steps
+        try:
+            steps_list = json.loads(steps) if isinstance(steps, str) else steps
+        except Exception:
+            steps_list = [steps]
+        if isinstance(steps_list, list):
+            if all(isinstance(s, dict) for s in steps_list):
+                steps_text = "\n".join(f"{j}. {s.get('description', str(s))}" for j, s in enumerate(steps_list, 1))
+            else:
+                steps_text = "\n".join(f"{j}. {s}" for j, s in enumerate(steps_list, 1))
+        else:
+            steps_text = str(steps_list)
+        desc = (case.description or "").replace("\n", "\n")
+        for col, value in enumerate([i, case.name, desc, steps_text, case.url or ""], 1):
+            cell = ws.cell(row=i + 1, column=col, value=value)
+            cell.alignment = cell_alignment; cell.border = thin_border
+    import io
+    output = io.BytesIO()
+    wb.save(output); output.seek(0)
+    return output.getvalue()
+
+
+# ======================== 功能测试用例API ========================
+
+@app.get("/api/functional-cases")
+def api_get_functional_cases(db: Session = Depends(get_db)):
+    cases = crud.get_functional_cases(db)
+    return [{
+        "id": c.id, "case_id": c.case_id, "name": c.name, "module": c.module,
+        "priority": c.priority, "preconditions": c.preconditions,
+        "test_steps": c.test_steps, "expected_result": c.expected_result,
+        "test_data": c.test_data, "scenario_type": c.scenario_type,
+        "source_url": c.source_url, "created_at": str(c.created_at)
+    } for c in cases]
+
+
+@app.delete("/api/functional-cases/{case_id}")
+def api_delete_functional_case(case_id: int, db: Session = Depends(get_db)):
+    crud.delete_functional_case(db, case_id)
+    return {"success": True, "message": "删除成功"}
+
+
+class ConvertToAutoRequest(BaseModel):
+    case_ids: List[int] = []
+
+@app.post("/api/functional-cases/convert-to-auto")
+async def api_convert_to_auto(request: ConvertToAutoRequest, db: Session = Depends(get_db)):
+    converted = []
+    for fid in request.case_ids:
+        func_case = crud.get_functional_case(db, fid)
+        if not func_case:
+            logger.warning(f"功能用例 {fid} 不存在，跳过")
+            continue
+        try:
+            steps_list = json.loads(func_case.test_steps)
+        except Exception:
+            steps_list = [func_case.test_steps]
+        
+        func_case_info = {
+            "name": func_case.name,
+            "module": func_case.module or "",
+            "steps": steps_list,
+            "preconditions": func_case.preconditions or "",
+            "expected_result": func_case.expected_result or "",
+            "test_data": func_case.test_data or "",
+            "scenario_type": func_case.scenario_type or "",
+        }
+        
+        logger.info(f"🔄 开始AI转换功能用例: {func_case.name}")
+        try:
+            auto_steps = await asyncio.wait_for(
+                run_in_threadpool(ai_engine.ai_convert_func_to_auto_steps, func_case_info),
+                timeout=120.0
+            )
+            logger.info(f"✅ AI转换完成，生成 {len(auto_steps)} 个自动化步骤")
+        except asyncio.TimeoutError:
+            logger.warning(f"AI转换超时，使用原始步骤")
+            auto_steps = []
+        except Exception as e:
+            logger.warning(f"AI转换失败，使用原始步骤: {e}")
+            auto_steps = []
+        
+        if not auto_steps:
+            steps_text = "\n".join(steps_list) if isinstance(steps_list, list) else str(steps_list)
+            auto_steps = [{"action": "click", "selector": "", "value": "", "description": s} for s in (steps_list if isinstance(steps_list, list) else [steps_text])]
+        
+        desc_parts = []
+        if func_case.module:
+            desc_parts.append(f"【模块】{func_case.module}")
+        if func_case.priority:
+            desc_parts.append(f"【优先级】{func_case.priority}")
+        if func_case.scenario_type:
+            desc_parts.append(f"【场景类型】{func_case.scenario_type}")
+        if func_case.preconditions:
+            desc_parts.append(f"【前置条件】{func_case.preconditions}")
+        if func_case.test_data:
+            desc_parts.append(f"【测试数据】{func_case.test_data}")
+        if func_case.expected_result:
+            desc_parts.append(f"【预期结果】{func_case.expected_result}")
+        
+        auto_case = schemas.TestCaseCreate(
+            name=f"{func_case.case_id} {func_case.name}",
+            description="\n".join(desc_parts),
+            url=func_case.source_url or "",
+            test_type="web",
+            steps=json.dumps(auto_steps, ensure_ascii=False)
+        )
+        db_case = crud.create_test_case(db=db, case=auto_case)
+        converted.append({"id": db_case.id, "name": db_case.name})
+        logger.info(f"✅ 已创建自动化用例: {db_case.name}")
+    
+    logger.info(f"✅ 转换完成，共转换 {len(converted)} 个用例")
+    return {"success": True, "converted": converted, "count": len(converted)}
+
+
+class FuncExportRequest(BaseModel):
+    case_ids: List[int] = []
+    format: str = "html"
+
+
+@app.post("/api/functional-cases/export")
+def api_export_functional_cases(request: FuncExportRequest, db: Session = Depends(get_db)):
+    try:
+        if request.case_ids:
+            cases = []
+            for cid in request.case_ids:
+                c = crud.get_functional_case(db, cid)
+                if c:
+                    cases.append(c)
+        else:
+            cases = crud.get_functional_cases(db)
+        if not cases:
+            raise HTTPException(status_code=404, detail="没有可导出的功能用例")
+        if request.format == "html":
+            return Response(
+                content=_build_func_export_html(cases),
+                media_type="text/html; charset=utf-8",
+                headers={"Content-Disposition": "attachment; filename=functional_test_cases.html"}
+            )
+        elif request.format == "excel":
+            return Response(
+                content=_build_func_export_excel(cases),
+                media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                headers={"Content-Disposition": "attachment; filename=functional_test_cases.xlsx"}
+            )
+        else:
+            raise HTTPException(status_code=400, detail=f"不支持的导出格式：{request.format}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"功能用例导出失败：{str(e)}")
+
+
+# ------------------- AI对话接口 -------------------
+from .chat_agent import chat_with_agent, get_run_status_stream
+from fastapi.responses import StreamingResponse
+
+
+class ChatRequest(BaseModel):
+    message: str
+    history: List[dict] = []
+
+
+@app.post("/api/chat")
+def api_chat(request: ChatRequest):
+    """AI对话接口：发送消息，AI理解意图后执行操作（如运行用例、查看结果等）"""
+    try:
+        result = chat_with_agent(request.message, request.history)
+        return {
+            "success": True,
+            "reply": result["reply"],
+            "tool_calls": result.get("tool_calls", []),
+            "run_id": result.get("run_id")
+        }
+    except Exception as e:
+        logger.error(f"AI对话失败: {e}")
+        return {
+            "success": False,
+            "reply": f"❌ AI对话服务异常: {str(e)}",
+            "tool_calls": [],
+            "run_id": None
+        }
+
+
+@app.get("/api/chat/run/{run_id}/stream")
+def api_chat_run_stream(run_id: str):
+    """SSE流式获取测试运行实时状态"""
+    return StreamingResponse(
+        get_run_status_stream(run_id),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
+        }
+    )
+
+
+# ------------------- 辅助函数 -------------------
+    rows = ""
+    for i, case in enumerate(cases, 1):
+        steps = case.test_steps or ""
+        try:
+            steps_list = json.loads(steps) if isinstance(steps, str) else steps
+        except Exception:
+            steps_list = [steps]
+        if isinstance(steps_list, list):
+            steps_html = "<br>".join(f"{j}. {s}" for j, s in enumerate(steps_list, 1))
+        else:
+            steps_html = str(steps_list)
+        rows += f"""<tr><td>{i}</td><td>{case.case_id}</td><td>{case.name}</td><td>{case.module}</td>
+<td>{case.priority}</td><td>{case.scenario_type}</td><td>{case.preconditions.replace(chr(10), '<br>') if case.preconditions else ''}</td>
+<td>{steps_html}</td><td>{case.expected_result.replace(chr(10), '<br>') if case.expected_result else ''}</td>
+<td>{case.test_data.replace(chr(10), '<br>') if case.test_data else ''}</td></tr>"""
+    return f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><title>功能测试用例导出</title>
+<style>body{{font-family:'Microsoft YaHei',sans-serif;padding:20px}}h1{{text-align:center;color:#333}}
+table{{width:100%;border-collapse:collapse;margin-top:20px}}th,td{{border:1px solid #ddd;padding:10px;text-align:left;vertical-align:top}}
+th{{background-color:#409eff;color:white}}tr:nth-child(even){{background-color:#f9f9f9}}</style></head>
+<body><h1>功能测试用例</h1><table><thead><tr><th style="width:50px">序号</th><th style="width:140px">编号</th><th style="width:200px">名称</th>
+<th style="width:80px">模块</th><th style="width:60px">优先级</th><th style="width:90px">场景类型</th><th style="width:150px">前置条件</th>
+<th>测试步骤</th><th style="width:150px">预期结果</th><th style="width:150px">测试数据</th></tr></thead><tbody>{rows}</tbody></table></body></html>"""
+
+
+def _build_func_export_excel(cases) -> bytes:
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+    except ImportError:
+        raise HTTPException(status_code=500, detail="请安装openpyxl：pip install openpyxl")
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "功能测试用例"
+    header_font = Font(name="微软雅黑", bold=True, color="FFFFFF", size=11)
+    header_fill = PatternFill(start_color="409EFF", end_color="409EFF", fill_type="solid")
+    header_alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    cell_alignment = Alignment(vertical="top", wrap_text=True)
+    thin_border = Border(left=Side(style="thin"), right=Side(style="thin"), top=Side(style="thin"), bottom=Side(style="thin"))
+    headers = ["序号", "编号", "名称", "模块", "优先级", "场景类型", "前置条件", "测试步骤", "预期结果", "测试数据"]
+    for col, header in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=col, value=header)
+        cell.font = header_font; cell.fill = header_fill; cell.alignment = header_alignment; cell.border = thin_border
+    widths = [6, 14, 25, 10, 8, 12, 30, 45, 30, 25]
+    col_letters = ['A','B','C','D','E','F','G','H','I','J']
+    for i, w in enumerate(widths):
+        ws.column_dimensions[col_letters[i]].width = w
+    for i, case in enumerate(cases, 1):
+        steps = case.test_steps or ""
+        try:
+            steps_list = json.loads(steps) if isinstance(steps, str) else steps
+        except Exception:
+            steps_list = [steps]
+        if isinstance(steps_list, list):
+            steps_text = "\n".join(f"{j}. {s}" for j, s in enumerate(steps_list, 1))
+        else:
+            steps_text = str(steps_list)
+        row_data = [i, case.case_id, case.name, case.module, case.priority, case.scenario_type,
+                    case.preconditions or "", steps_text, case.expected_result or "", case.test_data or ""]
+        for col, value in enumerate(row_data, 1):
+            cell = ws.cell(row=i + 1, column=col, value=value)
+            cell.alignment = cell_alignment; cell.border = thin_border
+    import io
+    output = io.BytesIO()
+    wb.save(output); output.seek(0)
+    return output.getvalue()

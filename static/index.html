@@ -14,6 +14,52 @@
         .el-button + .el-button { margin-left: 5px; }
         .batch-task-table { margin-top: 15px; }
         .preview-textarea { max-height: 300px; }
+        .chat-fab { position: fixed; bottom: 30px; right: 30px; width: 56px; height: 56px;
+            border-radius: 50%; background: #409eff; color: #fff; border: none;
+            font-size: 24px; cursor: pointer; box-shadow: 0 4px 16px rgba(64,158,255,0.4);
+            z-index: 9999; display: flex; align-items: center; justify-content: center;
+            transition: all 0.3s; }
+        .chat-fab:hover { background: #337ecc; transform: scale(1.05); }
+        .chat-fab .badge { position: absolute; top: -2px; right: -2px; background: #f56c6c; color: #fff;
+            border-radius: 50%; width: 20px; height: 20px; font-size: 12px; display: flex;
+            align-items: center; justify-content: center; }
+        .chat-panel { position: fixed; bottom: 100px; right: 30px; width: 420px; max-height: 560px;
+            background: #fff; border-radius: 16px; box-shadow: 0 8px 32px rgba(0,0,0,0.15);
+            z-index: 9998; display: flex; flex-direction: column; overflow: hidden; }
+        .chat-header { display: flex; align-items: center; justify-content: space-between;
+            padding: 14px 18px; background: #409eff; color: #fff; font-weight: 600;
+            font-size: 15px; cursor: pointer; }
+        .chat-header .actions { display: flex; gap: 8px; }
+        .chat-header .actions button { background: rgba(255,255,255,0.2); border: none; color: #fff;
+            border-radius: 6px; padding: 4px 10px; cursor: pointer; font-size: 12px; }
+        .chat-messages { flex: 1; overflow-y: auto; padding: 14px; display: flex; flex-direction: column; gap: 10px;
+            max-height: 380px; background: #f5f7fa; }
+        .chat-msg { display: flex; gap: 8px; animation: fadeIn 0.3s; }
+        .chat-msg.user { justify-content: flex-end; }
+        .chat-msg .avatar { width: 32px; height: 32px; border-radius: 50%; display: flex;
+            align-items: center; justify-content: center; font-size: 16px; flex-shrink: 0; }
+        .chat-msg .avatar.ai { background: #e6f4ff; color: #409eff; }
+        .chat-msg .avatar.user { background: #409eff; color: #fff; order: 1; }
+        .chat-msg .bubble { max-width: 75%; padding: 10px 14px; border-radius: 14px;
+            font-size: 13px; line-height: 1.6; word-break: break-word; white-space: pre-wrap; }
+        .chat-msg.ai .bubble { background: #fff; border: 1px solid #e8e8e8; }
+        .chat-msg.user .bubble { background: #409eff; color: #fff; }
+        .chat-msg .bubble code { background: rgba(0,0,0,0.06); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+        .chat-msg.user .bubble code { background: rgba(255,255,255,0.2); }
+        .chat-input-area { display: flex; gap: 8px; padding: 12px; border-top: 1px solid #eee; background: #fff; }
+        .chat-input-area input { flex: 1; border: 1px solid #ddd; border-radius: 20px; padding: 8px 16px;
+            font-size: 13px; outline: none; }
+        .chat-input-area input:focus { border-color: #409eff; }
+        .chat-input-area button { background: #409eff; color: #fff; border: none; border-radius: 20px;
+            padding: 8px 18px; cursor: pointer; font-size: 13px; }
+        .chat-input-area button:disabled { background: #a0cfff; cursor: not-allowed; }
+        .chat-run-box { margin: 8px 0; padding: 10px; background: #f0f9eb; border-radius: 8px;
+            border: 1px solid #b7eb8f; font-size: 12px; max-height: 150px; overflow-y: auto; }
+        .chat-run-box .run-line { color: #333; line-height: 1.8; }
+        .chat-run-box .run-line.success { color: #52c41a; }
+        .chat-run-box .run-line.failed { color: #ff4d4f; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); }
+            to { opacity: 1; transform: translateY(0); } }
     </style>
 </head>
 <body>
@@ -27,35 +73,79 @@
                 <el-row :gutter="20">
                     <el-col :span="12">
                         <el-card header="📋 测试用例列表" style="height: 100%;">
-                            <div style="margin-bottom: 15px; display: flex; gap: 10px; flex-wrap: wrap;">
-                                <el-button type="primary" @click="showCreateDialog">➕ 新建测试用例</el-button>
-                                <el-button type="success" icon="magic" @click="showAutoGenDialog">🧪 AI生成多场景用例</el-button>
-                                <el-button type="warning" icon="document" @click="showDocGenDialog">📄 文档解析生成</el-button>
-                                <el-button type="info" icon="search" @click="showExploratoryDialog">🔍 探索性生成</el-button>
-                                <el-button type="primary" @click="showRecordDialog">🎥 开始录制</el-button>
-                                <el-button type="success" @click="batchRun" :disabled="selectedCases.length === 0">
-                                    🚀 批量运行 ({{ selectedCases.length }})
-                                </el-button>
-                            </div>
-                            <el-table
-                                :data="testCases"
-                                border
-                                stripe
-                                style="width: 100%;"
-                                @selection-change="handleSelectionChange">
-                                <el-table-column type="selection" width="55"></el-table-column>
-                                <el-table-column prop="id" label="ID" width="80"></el-table-column>
-                                <el-table-column prop="name" label="用例名称"></el-table-column>
-                                <el-table-column prop="test_type" label="类型" width="100"></el-table-column>
-                                <el-table-column label="操作" width="320">
-                                    <template #default="scope">
-                                        <el-button size="small" type="success" @click="runTestCase(scope.row.id)">▶️ 运行</el-button>
-                                        <el-button size="small" type="info" @click="viewTestCase(scope.row)">👁️ 查看</el-button>
-                                        <el-button size="small" type="warning" @click="editTestCase(scope.row)">✏️ 编辑</el-button>
-                                        <el-button size="small" type="danger" @click="deleteTestCase(scope.row)">🗑️ 删除</el-button>
-                                    </template>
-                                </el-table-column>
-                            </el-table>
+                            <el-tabs v-model="activeTab" @tab-change="onTabChange">
+                                <el-tab-pane label="🤖 自动化用例" name="auto">
+                                    <div style="margin-bottom: 15px; display: flex; gap: 10px; flex-wrap: wrap;">
+                                        <el-button type="primary" @click="showCreateDialog">➕ 新建</el-button>
+                                        <el-button type="primary" @click="showRecordDialog">🎥 录制</el-button>
+                                        <el-button type="success" @click="batchRun" :disabled="selectedCases.length === 0">
+                                            🚀 批量运行 ({{ selectedCases.length }})
+                                        </el-button>
+                                    </div>
+                                    <el-table :data="testCases" border stripe style="width: 100%;" @selection-change="handleSelectionChange">
+                                        <el-table-column type="selection" width="55"></el-table-column>
+                                        <el-table-column prop="id" label="ID" width="80"></el-table-column>
+                                        <el-table-column prop="name" label="用例名称"></el-table-column>
+                                        <el-table-column prop="test_type" label="类型" width="100"></el-table-column>
+                                        <el-table-column label="操作" width="320">
+                                            <template #default="scope">
+                                                <el-button size="small" type="success" @click="runTestCase(scope.row.id)">▶️ 运行</el-button>
+                                                <el-button size="small" type="info" @click="viewTestCase(scope.row)">👁️ 查看</el-button>
+                                                <el-button size="small" type="warning" @click="editTestCase(scope.row)">✏️ 编辑</el-button>
+                                                <el-button size="small" type="danger" @click="deleteTestCase(scope.row)">🗑️ 删除</el-button>
+                                            </template>
+                                        </el-table-column>
+                                    </el-table>
+                                </el-tab-pane>
+                                <el-tab-pane label="📝 功能用例" name="func">
+                                    <div style="margin-bottom: 15px; display: flex; gap: 10px; flex-wrap: wrap;">
+                                        <el-button type="success" icon="magic" @click="showAutoGenDialog">🧪 AI生成多场景</el-button>
+                                        <el-button type="warning" icon="document" @click="showDocGenDialog">📄 文档/原型解析</el-button>
+                                        <el-button type="info" icon="search" @click="showExploratoryDialog">🔍 探索性生成</el-button>
+                                        <el-button type="primary" @click="convertToAuto" :disabled="funcSelectedCases.length === 0" :loading="converting">
+                                            🔄 转为自动化 ({{ funcSelectedCases.length }})
+                                        </el-button>
+                                        <el-button type="danger" @click="deleteFuncCase" :disabled="funcSelectedCases.length === 0">
+                                            🗑️ 删除选中
+                                        </el-button>
+                                        <el-button type="warning" @click="exportFuncCases('html')" :disabled="funcSelectedCases.length === 0">
+                                            📥 导出HTML
+                                        </el-button>
+                                        <el-button type="warning" @click="exportFuncCases('excel')" :disabled="funcSelectedCases.length === 0">
+                                            📊 导出Excel
+                                        </el-button>
+                                    </div>
+                                    <el-table :data="pagedFunctionalCases" border stripe style="width: 100%;" @selection-change="handleFuncSelectionChange" row-key="id">
+                                        <el-table-column type="selection" width="55"></el-table-column>
+                                        <el-table-column prop="case_id" label="编号" width="140"></el-table-column>
+                                        <el-table-column prop="name" label="用例名称" min-width="200"></el-table-column>
+                                        <el-table-column prop="module" label="模块" width="100"></el-table-column>
+                                        <el-table-column prop="priority" label="优先级" width="80">
+                                            <template #default="scope">
+                                                <el-tag :type="scope.row.priority === 'P0' ? 'danger' : scope.row.priority === 'P1' ? 'warning' : scope.row.priority === 'P2' ? 'info' : ''" size="small">{{ scope.row.priority }}</el-tag>
+                                            </template>
+                                        </el-table-column>
+                                        <el-table-column prop="scenario_type" label="场景类型" width="100"></el-table-column>
+                                        <el-table-column label="操作" width="120">
+                                            <template #default="scope">
+                                                <el-button size="small" type="info" @click="viewFuncCase(scope.row)">👁️ 查看</el-button>
+                                                <el-button size="small" type="danger" @click="deleteFuncCase(scope.row)">🗑️</el-button>
+                                            </template>
+                                        </el-table-column>
+                                    </el-table>
+                                    <div style="margin-top: 15px; display: flex; justify-content: flex-end;">
+                                        <el-pagination
+                                            background
+                                            layout="total, sizes, prev, pager, next, jumper"
+                                            :total="functionalCases.length"
+                                            :page-sizes="[10, 20, 50, 100]"
+                                            :page-size="funcPageSize"
+                                            v-model:current-page="funcCurrentPage"
+                                            v-model:page-size="funcPageSize"
+                                        />
+                                    </div>
+                                </el-tab-pane>
+                            </el-tabs>
                         </el-card>
                     </el-col>
                     <el-col :span="12">
@@ -212,18 +302,33 @@
                     <el-collapse-item title="🔐 网页需要登录？（高级选项）" name="login">
                         <el-alert type="info" :closable="false" show-icon style="margin-bottom: 10px;">
                             <template #title>
-                                如果原型/网页需要登录才能访问，请填写登录信息
+                                如果原型/网页需要登录才能访问，请填写登录信息或使用手动登录模式
                             </template>
                         </el-alert>
-                        <el-form-item label="登录URL">
-                            <el-input v-model="docGenForm.login_url" placeholder="登录页面URL（通常与目标URL相同域名）" style="width: 100%;"></el-input>
+                        <el-form-item label="登录模式">
+                            <el-radio-group v-model="docGenForm.manual_login">
+                                <el-radio :value="false">自动登录（AI自动填写）</el-radio>
+                                <el-radio :value="true">手动登录（打开浏览器手动操作）</el-radio>
+                            </el-radio-group>
                         </el-form-item>
-                        <el-form-item label="用户名">
-                            <el-input v-model="docGenForm.login_username" placeholder="登录用户名/手机号" style="width: 100%;"></el-input>
-                        </el-form-item>
-                        <el-form-item label="密码">
-                            <el-input v-model="docGenForm.login_password" type="password" placeholder="登录密码" style="width: 100%;"></el-input>
-                        </el-form-item>
+                        <template v-if="!docGenForm.manual_login">
+                            <el-form-item label="登录URL">
+                                <el-input v-model="docGenForm.login_url" placeholder="登录页面URL（通常与目标URL相同域名）" style="width: 100%;"></el-input>
+                            </el-form-item>
+                            <el-form-item label="用户名">
+                                <el-input v-model="docGenForm.login_username" placeholder="登录用户名/手机号" style="width: 100%;"></el-input>
+                            </el-form-item>
+                            <el-form-item label="密码">
+                                <el-input v-model="docGenForm.login_password" type="password" placeholder="登录密码" style="width: 100%;"></el-input>
+                            </el-form-item>
+                        </template>
+                        <template v-else>
+                            <el-alert type="warning" :closable="false" show-icon>
+                                <template #title>
+                                    点击"生成"后将打开浏览器窗口，请在浏览器中手动完成登录，然后点击页面右上角的蓝色"登录完成"按钮
+                                </template>
+                            </el-alert>
+                        </template>
                     </el-collapse-item>
                 </el-collapse>
                 <el-divider content-position="left">📁 文档上传</el-divider>
@@ -252,12 +357,109 @@
                 <el-form-item label="文档内容">
                     <el-input v-model="docGenForm.document_text" type="textarea" rows="8" placeholder="或直接粘贴文档内容..." style="width: 100%;"></el-input>
                 </el-form-item>
+                <el-divider content-position="left" v-if="docGenAnalysis">📊 需求分析结果</el-divider>
+                <template v-if="docGenAnalysis">
+                    <el-descriptions :column="1" border style="margin-bottom: 20px;">
+                        <el-descriptions-item label="产品名称">{{ docGenAnalysis.product_name }}</el-descriptions-item>
+                        <el-descriptions-item label="功能概述">{{ docGenAnalysis.product_summary }}</el-descriptions-item>
+                    </el-descriptions>
+                    <el-card shadow="hover" style="margin-bottom: 15px;">
+                        <template #header><div style="font-weight: bold;">🚀 核心功能</div></template>
+                        <div v-for="(f, idx) in docGenAnalysis.core_features" :key="idx" style="margin-bottom: 10px;">
+                            <strong>{{ f.feature }}</strong>
+                            <div style="color: #666; margin-left: 10px;">{{ f.description }}</div>
+                            <div style="color: #e6a23c; margin-left: 10px;" v-if="f.test_focus">🎯 测试关注：{{ f.test_focus }}</div>
+                        </div>
+                    </el-card>
+                    <el-card shadow="hover" style="margin-bottom: 15px;" v-if="docGenAnalysis.business_processes && docGenAnalysis.business_processes.length">
+                        <template #header><div style="font-weight: bold;">📊 业务流程</div></template>
+                        <div v-for="(bp, idx) in docGenAnalysis.business_processes" :key="idx" style="margin-bottom: 10px;">
+                            <strong>{{ bp.process }}</strong>
+                            <ul style="margin-top:5px;">
+                                <li v-for="(s, i) in bp.steps" :key="i">{{ s }}</li>
+                            </ul>
+                            <div v-if="bp.branch_points && bp.branch_points.length" style="color: #e6a23c;">
+                                分支点：{{ bp.branch_points.join('、') }}
+                            </div>
+                        </div>
+                    </el-card>
+                    <el-card shadow="hover" style="margin-bottom: 15px;">
+                        <template #header><div style="font-weight: bold;">📋 功能模块</div></template>
+                        <div v-for="(m, idx) in docGenAnalysis.modules" :key="idx" style="margin-bottom: 10px;">
+                            <strong>{{ m.name }}</strong>: {{ m.description }}
+                            <ul style="margin-top:5px;">
+                                <li v-for="(f, i) in m.features" :key="i">{{ f }}</li>
+                            </ul>
+                            <div v-if="m.test_scenarios && m.test_scenarios.length" style="color: #e6a23c; margin-top: 5px;">
+                                🧪 测试场景：
+                                <ul style="margin-top:3px;">
+                                    <li v-for="(ts, j) in m.test_scenarios" :key="j">{{ ts }}</li>
+                                </ul>
+                            </div>
+                        </div>
+                    </el-card>
+                    <el-card shadow="hover" style="margin-bottom: 15px;" v-if="docGenAnalysis.test_strategy">
+                        <template #header><div style="font-weight: bold;">🧪 测试策略</div></template>
+                        <el-row :gutter="20">
+                            <el-col :span="12" v-if="docGenAnalysis.test_strategy.smoke_tests">
+                                <div style="font-weight: bold; color: #67c23a;">🔥 冒烟测试</div>
+                                <ul>
+                                    <li v-for="(t, idx) in docGenAnalysis.test_strategy.smoke_tests" :key="idx">{{ t }}</li>
+                                </ul>
+                            </el-col>
+                            <el-col :span="12" v-if="docGenAnalysis.test_strategy.functional_tests">
+                                <div style="font-weight: bold; color: #409eff;">✅ 功能测试</div>
+                                <ul>
+                                    <li v-for="(t, idx) in docGenAnalysis.test_strategy.functional_tests" :key="idx">{{ t }}</li>
+                                </ul>
+                            </el-col>
+                        </el-row>
+                        <el-row :gutter="20" style="margin-top: 10px;">
+                            <el-col :span="12" v-if="docGenAnalysis.test_strategy.edge_cases">
+                                <div style="font-weight: bold; color: #e6a23c;">⚠️ 边界条件</div>
+                                <ul>
+                                    <li v-for="(t, idx) in docGenAnalysis.test_strategy.edge_cases" :key="idx">{{ t }}</li>
+                                </ul>
+                            </el-col>
+                            <el-col :span="12" v-if="docGenAnalysis.test_strategy.exception_tests">
+                                <div style="font-weight: bold; color: #f56c6c;">❌ 异常场景</div>
+                                <ul>
+                                    <li v-for="(t, idx) in docGenAnalysis.test_strategy.exception_tests" :key="idx">{{ t }}</li>
+                                </ul>
+                            </el-col>
+                        </el-row>
+                    </el-card>
+                    <el-row :gutter="20">
+                        <el-col :span="12">
+                            <el-card shadow="hover">
+                                <template #header><div style="font-weight: bold;">⚠️ 风险点</div></template>
+                                <ul>
+                                    <li v-for="(r, idx) in docGenAnalysis.risks" :key="idx">{{ r }}</li>
+                                </ul>
+                            </el-card>
+                        </el-col>
+                        <el-col :span="12">
+                            <el-card shadow="hover">
+                                <template #header><div style="font-weight: bold;">💡 测试建议</div></template>
+                                <ul>
+                                    <li v-for="(s, idx) in docGenAnalysis.test_priority_suggestions" :key="idx">{{ s }}</li>
+                                </ul>
+                            </el-card>
+                        </el-col>
+                    </el-row>
+                </template>
                 <el-form-item label="生成结果预览" v-if="docGenPreview">
                     <el-input v-model="docGenPreview" type="textarea" readonly class="preview-textarea" placeholder="生成的用例JSON预览..." style="width: 100%;"></el-input>
                 </el-form-item>
             </el-form>
             <template #footer>
                 <el-button @click="docGenDialogVisible = false; resetDocGenForm()">关闭</el-button>
+                <template v-if="!docGenAnalysis">
+                    <el-button type="primary" @click="analyzeDocGen" :loading="docGenLoading">🔍 需求分析</el-button>
+                </template>
+                <template v-else>
+                    <el-button type="danger" @click="resetDocGenForm()">🔄 重新分析</el-button>
+                </template>
                 <el-button type="info" @click="previewDocGenCases" :loading="docGenLoading">👁️ 预览生成</el-button>
                 <el-button type="success" @click="docGenAndSaveCases" :loading="docGenLoading">💾 生成并入库</el-button>
             </template>
@@ -310,6 +512,43 @@
                 <el-button type="success" @click="exploratoryAndSaveCases" :loading="exploratoryLoading">💾 生成并入库</el-button>
             </template>
         </el-dialog>
+
+        <!-- AI对话面板 -->
+        <button class="chat-fab" @click="toggleChat" v-show="!chatOpen">
+            💬
+            <span class="badge" v-if="chatUnread">{{ chatUnread }}</span>
+        </button>
+        <div class="chat-panel" v-show="chatOpen">
+            <div class="chat-header" @click="toggleChat">
+                🤖 AI测试助手
+                <div class="actions">
+                    <button @click.stop="clearChat">🗑️ 清空</button>
+                    <button @click.stop="chatOpen = false">✕</button>
+                </div>
+            </div>
+            <div class="chat-messages" ref="chatMsgContainer">
+                <div v-for="(msg, idx) in chatMessages" :key="idx" :class="['chat-msg', msg.role]">
+                    <div :class="['avatar', msg.role]">{{ msg.role === 'user' ? '👤' : '🤖' }}</div>
+                    <div class="bubble" v-html="formatChatMsg(msg.content)"></div>
+                </div>
+                <div v-if="chatLoading" class="chat-msg ai">
+                    <div class="avatar ai">🤖</div>
+                    <div class="bubble" style="color:#999;">思考中...</div>
+                </div>
+            </div>
+            <div v-if="activeRunId" class="chat-run-box" ref="chatRunBox">
+                <div v-for="(line, idx) in runLogLines" :key="idx"
+                     :class="['run-line', line.includes('✅') ? 'success' : line.includes('❌') ? 'failed' : '']">
+                    {{ line }}
+                </div>
+            </div>
+            <div class="chat-input-area">
+                <input v-model="chatInput" @keyup.enter="sendChat"
+                    placeholder="输入消息，如：运行登录用例 / 列出所有用例..."
+                    :disabled="chatLoading" />
+                <button @click="sendChat" :disabled="chatLoading || !chatInput.trim()">发送</button>
+            </div>
+        </div>
     </div>
 
     <script>
@@ -319,6 +558,15 @@
             setup() {
                 // 原有数据
                 const testCases = ref([]);
+                const activeTab = ref('auto');
+                const functionalCases = ref([]);
+                const funcSelectedCases = ref([]);
+                const funcCurrentPage = ref(1);
+                const funcPageSize = ref(10);
+                const pagedFunctionalCases = computed(() => {
+                    const start = (funcCurrentPage.value - 1) * funcPageSize.value;
+                    return functionalCases.value.slice(start, start + funcPageSize.value);
+                });
                 const createDialogVisible = ref(false);
                 const newCase = ref({ name: '', description: '', test_type: 'web', url: '', steps: '' });
                 const isEdit = ref(false);
@@ -348,21 +596,14 @@
                 const docGenDialogVisible = ref(false);
                 const docGenLoading = ref(false);
                 const docGenPreview = ref('');
-                const docGenForm = ref({ document_text: '', doc_type: 'prd', url: '', source_url: '', login_url: '', login_username: '', login_password: '' });
+                const docGenAnalysis = ref(null);
+                const docGenForm = ref({ document_text: '', doc_type: 'prd', url: '', source_url: '', login_url: '', login_username: '', login_password: '', manual_login: false });
                 const docUploadRef = ref(null);
                 const docFileList = ref([]);
 
                 // 探索性生成
                 const exploratoryDialogVisible = ref(false);
                 const exploratoryLoading = ref(false);
-
-
-
-
-
-
-
-
                 const exploratoryPreview = ref('');
                 const exploratoryForm = ref({ url: '', login_url: '', username: '', password: '', username_selector: '', password_selector: '', submit_selector: '' });
 
@@ -411,6 +652,40 @@
                     }
                 };
 
+                const exportCases = async (format) => {
+                    const ids = selectedCases.value.length > 0 ? selectedCases.value.map(c => c.id) : [];
+                    try {
+                        const res = await axios.post('/api/export-cases', { case_ids: ids, format }, { responseType: 'blob' });
+                        const blob = new Blob([res.data], { type: res.headers['content-type'] });
+                        const url = window.URL.createObjectURL(blob);
+                        const a = document.createElement('a');
+                        a.href = url;
+                        a.download = format === 'excel' ? 'test_cases_export.xlsx' : 'test_cases_export.html';
+                        a.click();
+                        window.URL.revokeObjectURL(url);
+                        ElementPlus.ElMessage.success(`✅ 导出成功`);
+                    } catch (e) {
+                        ElementPlus.ElMessage.error('导出失败：' + (e.response?.data?.detail || e.message));
+                    }
+                };
+
+                const exportFuncCases = async (format) => {
+                    const ids = funcSelectedCases.value.length > 0 ? funcSelectedCases.value.map(c => c.id) : [];
+                    try {
+                        const res = await axios.post('/api/functional-cases/export', { case_ids: ids, format }, { responseType: 'blob' });
+                        const blob = new Blob([res.data], { type: res.headers['content-type'] });
+                        const url = window.URL.createObjectURL(blob);
+                        const a = document.createElement('a');
+                        a.href = url;
+                        a.download = format === 'excel' ? 'functional_test_cases.xlsx' : 'functional_test_cases.html';
+                        a.click();
+                        window.URL.revokeObjectURL(url);
+                        ElementPlus.ElMessage.success(`✅ 功能用例导出成功`);
+                    } catch (e) {
+                        ElementPlus.ElMessage.error('导出失败：' + (e.response?.data?.detail || e.message));
+                    }
+                };
+
                 const startBatchPolling = () => {
                     stopBatchPolling();
                     batchPolling.value = true;
@@ -449,6 +724,119 @@
                         testCases.value = res.data;
                     } catch (e) {
                         ElementPlus.ElMessage.error('获取用例列表失败');
+                    }
+                };
+
+                const getFunctionalCases = async () => {
+                    try {
+                        const res = await axios.get('/api/functional-cases');
+                        functionalCases.value = res.data;
+                    } catch (e) {
+                        ElementPlus.ElMessage.error('获取功能用例列表失败');
+                    }
+                };
+
+                const onTabChange = (tabName) => {
+                    if (tabName === 'auto') {
+                        getTestCases();
+                    } else if (tabName === 'func') {
+                        getFunctionalCases();
+                    }
+                };
+
+                const handleFuncSelectionChange = (selection) => {
+                    funcSelectedCases.value = selection;
+                };
+
+                const viewFuncCase = (row) => {
+                    let stepsText = '';
+                    try {
+                        const steps = JSON.parse(row.test_steps);
+                        stepsText = steps.map((s, i) => `${i+1}. ${s}`).join('\n');
+                    } catch (e) {
+                        stepsText = row.test_steps;
+                    }
+                    const info = [
+                        `【编号】${row.case_id}`,
+                        `【名称】${row.name}`,
+                        `【模块】${row.module}`,
+                        `【优先级】${row.priority}`,
+                        `【场景类型】${row.scenario_type}`,
+                        `【前置条件】${row.preconditions}`,
+                        `【测试数据】${row.test_data}`,
+                        `【预期结果】${row.expected_result}`,
+                        `【测试步骤】\n${stepsText}`,
+                        `【来源URL】${row.source_url}`,
+                    ].join('\n');
+                    ElementPlus.ElMessageBox.alert(info, '功能用例详情', {
+                        confirmButtonText: '关闭',
+                        dangerouslyUseHTMLString: false
+                    });
+                };
+
+                const deleteFuncCase = async (row) => {
+                    let ids = [];
+                    if (row && row.id) {
+                        ids = [row.id];
+                    } else {
+                        ids = funcSelectedCases.value.map(c => c.id);
+                    }
+                    if (ids.length === 0) {
+                        ElementPlus.ElMessage.warning('请选择要删除的用例');
+                        return;
+                    }
+                    try {
+                        await ElementPlus.ElMessageBox.confirm(`确定要删除 ${ids.length} 个功能用例吗？`, '删除确认', {
+                            confirmButtonText: '确定删除',
+                            cancelButtonText: '取消',
+                            type: 'warning'
+                        });
+                        for (const id of ids) {
+                            await axios.delete(`/api/functional-cases/${id}`);
+                        }
+                        ElementPlus.ElMessage.success(`✅ 已删除 ${ids.length} 个功能用例`);
+                        getFunctionalCases();
+                    } catch (e) {
+                        if (e !== 'cancel') {
+                            ElementPlus.ElMessage.error('删除失败：' + (e.response?.data?.detail || e.message));
+                        }
+                    }
+                };
+
+                const converting = ref(false);
+                const convertToAuto = async () => {
+                    if (funcSelectedCases.value.length === 0) {
+                        ElementPlus.ElMessage.warning('请先选择要转换的功能用例');
+                        return;
+                    }
+                    try {
+                        await ElementPlus.ElMessageBox.confirm(
+                            `确定将 ${funcSelectedCases.value.length} 个功能用例转换为自动化用例吗？`, 
+                            '转换确认', { confirmButtonText: '确定转换', cancelButtonText: '取消', type: 'info' }
+                        );
+                    } catch (e) {
+                        if (e === 'cancel' || e === 'close') {
+                            return;
+                        }
+                        console.error('确认对话框异常:', e);
+                        return;
+                    }
+                    converting.value = true;
+                    try {
+                        const ids = funcSelectedCases.value.map(c => c.id);
+                        console.log('开始转换功能用例，IDs:', ids);
+                        const res = await axios.post('/api/functional-cases/convert-to-auto', { case_ids: ids }, { timeout: 300000 });
+                        console.log('转换响应:', res.data);
+                        ElementPlus.ElMessage.success(`✅ 成功转换 ${res.data.count} 个用例到自动化用例`);
+                        funcSelectedCases.value = [];
+                        getTestCases();
+                        activeTab.value = 'auto';
+                    } catch (e) {
+                        console.error('转换请求失败:', e);
+                        const errMsg = e.response?.data?.detail || e.message || '未知错误';
+                        ElementPlus.ElMessage.error('转换失败：' + errMsg);
+                    } finally {
+                        converting.value = false;
                     }
                 };
 
@@ -643,10 +1031,59 @@
                 };
 
                 const resetDocGenForm = () => {
-                    docGenForm.value = { document_text: '', doc_type: 'prd', url: '', source_url: '', login_url: '', login_username: '', login_password: '' };
+                    docGenForm.value = { document_text: '', doc_type: 'prd', url: '', source_url: '', login_url: '', login_username: '', login_password: '', manual_login: false };
                     docGenPreview.value = '';
+                    docGenAnalysis.value = null;
                     docGenLoading.value = false;
                     docFileList.value = [];
+                };
+
+                const analyzeDocGen = async () => {
+                    const hasFile = docFileList.value.length > 0;
+                    const hasText = docGenForm.value.document_text && docGenForm.value.document_text.trim();
+                    const hasUrl = docGenForm.value.source_url && docGenForm.value.source_url.trim();
+                    if (!hasFile && !hasText && !hasUrl) {
+                        ElementPlus.ElMessage.warning('请上传文档、粘贴文档内容或输入网页/原型链接');
+                        return;
+                    }
+                    docGenLoading.value = true;
+                    let docText = '';
+                    try {
+                        if (hasUrl) {
+                            // 如果是URL，使用墨刀遍历API
+                            const traverseRes = await axios.post('/api/ai/modao-traverse', { 
+                                url: docGenForm.value.source_url, 
+                                manual_login: docGenForm.value.manual_login 
+                            }, { timeout: 600000 });
+                            if (traverseRes.data.success) {
+                                docText = traverseRes.data.traverse_result.all_content;
+                            }
+                        } else if (hasFile) {
+                            docText = docGenForm.value.document_text;
+                        } else if (hasText) {
+                            docText = docGenForm.value.document_text;
+                        }
+                        
+                        if (!docText) {
+                            ElementPlus.ElMessage.warning('未获取到文档内容');
+                            return;
+                        }
+                        
+                        const analyzeRes = await axios.post('/api/ai/analyze', { 
+                            document_text: docText 
+                        }, { timeout: 420000 });
+                        
+                        if (analyzeRes.data.success) {
+                            docGenAnalysis.value = analyzeRes.data.analysis;
+                            docGenForm.value.document_text = docText; // 保存提取的内容用于后续生成
+                            ElementPlus.ElMessage.success('✅ 需求分析完成，请查看分析结果');
+                        }
+                    } catch (e) {
+                        const errMsg = e.response?.data?.detail || e.message || '请求异常';
+                        ElementPlus.ElMessage.error('需求分析失败：' + errMsg);
+                    } finally {
+                        docGenLoading.value = false;
+                    }
                 };
 
                 const handleDocFileChange = (file) => {
@@ -728,11 +1165,12 @@
                                 headers: { 'Content-Type': 'multipart/form-data' }
                             });
                         } else {
-                            res = await axios.post('/api/ai/generate-from-document-and-save', docGenForm.value, { timeout: 210000 });
+                            res = await axios.post('/api/ai/generate-from-document-and-save', docGenForm.value, { timeout: 300000 });
                         }
                         if (res.data.success) {
                             ElementPlus.ElMessage.success(`✅ 成功从文档生成并入库 ${res.data.saved_count} 个测试用例`);
-                            getTestCases();
+                            getFunctionalCases();
+                            activeTab.value = 'func';
                             docGenPreview.value = JSON.stringify(res.data.cases, null, 4);
                         }
                     } catch (e) {
@@ -784,8 +1222,9 @@
                     try {
                         const res = await axios.post('/api/ai/generate-exploratory-and-save', exploratoryForm.value, { timeout: 240000 });
                         if (res.data.success) {
-                            ElementPlus.ElMessage.success(`✅ 探索性生成并入库 ${res.data.saved_count} 个测试用例`);
-                            getTestCases();
+                            ElementPlus.ElMessage.success(`✅ 探索性生成并入库 ${res.data.saved_count} 个功能测试用例`);
+                            getFunctionalCases();
+                            activeTab.value = 'func';
                             exploratoryPreview.value = JSON.stringify(res.data.cases, null, 4);
                         }
                     } catch (e) {
@@ -805,8 +1244,9 @@
                     try {
                         const res = await axios.post('/api/ai/generate-and-save-cases', autoGenForm.value, { timeout: 180000 });
                         if (res.data.success) {
-                            ElementPlus.ElMessage.success(`✅ 成功生成并入库 ${res.data.saved_count} 个测试用例`);
-                            getTestCases();
+                            ElementPlus.ElMessage.success(`✅ 成功生成并入库 ${res.data.saved_count} 个功能测试用例`);
+                            getFunctionalCases();
+                            activeTab.value = 'func';
                             autoGenPreview.value = JSON.stringify(res.data.cases, null, 4);
                         }
                     } catch (e) {
@@ -899,6 +1339,7 @@
                 // 生命周期
                 onMounted(() => {
                     getTestCases();
+                    getFunctionalCases();
                 });
 
                 onBeforeUnmount(() => {
@@ -906,28 +1347,162 @@
                     forceCloseWs();
                 });
 
+                // ========== AI聊天功能 ==========
+                const chatOpen = ref(false);
+                const chatInput = ref('');
+                const chatMessages = ref([]);
+                const chatLoading = ref(false);
+                const chatUnread = ref(0);
+                const activeRunId = ref(null);
+                const runLogLines = ref([]);
+                const sseConnection = ref(null);
+                const chatMsgContainer = ref(null);
+
+                const toggleChat = () => {
+                    chatOpen.value = !chatOpen.value;
+                    chatUnread.value = 0;
+                    if (chatOpen.value && chatMessages.value.length === 0) {
+                        chatMessages.value.push({
+                            role: 'ai',
+                            content: '你好！我是 **AI测试助手** 🤖\n\n我可以帮你：\n- 📋 **列出用例**：发送「列出所有用例」\n- 🚀 **运行用例**：发送「运行登录用例」或「运行用例ID:3」\n- 📊 **查看结果**：发送「查看运行状态」\n\n请告诉我你需要什么帮助？'
+                        });
+                    }
+                };
+
+                const formatChatMsg = (text) => {
+                    if (!text) return '';
+                    return text
+                        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+                        .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+                        .replace(/`([^`]+)`/g, '<code>$1</code>')
+                        .replace(/\n/g, '<br>');
+                };
+
+                const scrollChatBottom = () => {
+                    setTimeout(() => {
+                        const el = chatMsgContainer.value;
+                        if (el) el.scrollTop = el.scrollHeight;
+                    }, 100);
+                };
+
+                const connectSSE = (runId) => {
+                    if (sseConnection.value) {
+                        sseConnection.value.close();
+                    }
+                    runLogLines.value = ['⏳ 正在连接测试运行状态...'];
+                    const es = new EventSource(`/api/chat/run/${runId}/stream`);
+                    sseConnection.value = es;
+
+                    es.onmessage = (event) => {
+                        try {
+                            const data = JSON.parse(event.data);
+                            if (data.type === 'error') {
+                                runLogLines.value.push('❌ ' + data.message);
+                                es.close();
+                                sseConnection.value = null;
+                                activeRunId.value = null;
+                            } else if (data.type === 'ping') {
+                                if (runLogLines.value.length === 1 && runLogLines.value[0].startsWith('⏳')) {
+                                    runLogLines.value = [data.message];
+                                }
+                            } else if (data.type === 'complete') {
+                                runLogLines.value.push(data.message);
+                                es.close();
+                                sseConnection.value = null;
+                                setTimeout(() => { activeRunId.value = null; }, 30000);
+                            } else if (data.type === 'status') {
+                                runLogLines.value.push(data.message);
+                                if (runLogLines.value.length > 50) {
+                                    runLogLines.value = runLogLines.value.slice(-50);
+                                }
+                            }
+                            scrollChatBottom();
+                        } catch (e) {}
+                    };
+
+                    es.onerror = () => {
+                        es.close();
+                        sseConnection.value = null;
+                        if (runLogLines.value.length === 1) {
+                            runLogLines.value = ['❌ 无法连接到运行状态'];
+                        }
+                    };
+                };
+
+                const sendChat = async () => {
+                    const text = chatInput.value.trim();
+                    if (!text || chatLoading.value) return;
+                    chatInput.value = '';
+                    chatMessages.value.push({ role: 'user', content: text });
+                    scrollChatBottom();
+                    chatLoading.value = true;
+
+                    try {
+                        const history = chatMessages.value.slice(-20).map(m => ({
+                            role: m.role === 'ai' ? 'assistant' : 'user',
+                            content: m.content
+                        }));
+                        const res = await axios.post('/api/chat', {
+                            message: text,
+                            history: history
+                        }, { timeout: 180000 });
+                        const reply = res.data.reply || '(AI没有返回内容)';
+                        chatMessages.value.push({ role: 'ai', content: reply });
+                        scrollChatBottom();
+                        if (res.data.run_id) {
+                            activeRunId.value = res.data.run_id;
+                            runLogLines.value = [];
+                            connectSSE(res.data.run_id);
+                        }
+                    } catch (e) {
+                        const errMsg = e.response?.data?.detail || e.message || '网络错误';
+                        chatMessages.value.push({ role: 'ai', content: '❌ 对话失败：' + errMsg });
+                    } finally {
+                        chatLoading.value = false;
+                        scrollChatBottom();
+                        if (!chatOpen.value) chatUnread.value++;
+                    }
+                };
+
+                const clearChat = () => {
+                    chatMessages.value = [];
+                    activeRunId.value = null;
+                    runLogLines.value = [];
+                    if (sseConnection.value) {
+                        sseConnection.value.close();
+                        sseConnection.value = null;
+                    }
+                };
+
                 return {
                     testCases, createDialogVisible, newCase, currentTask, taskQuery,
                     aiRequirement, aiGenerating, aiElementDesc, aiLocating, aiGeneratedLocator,
                     isEdit, editingCaseId,
-                    getTestCases, submitTestCase, runTestCase, queryTask, aiGenerateSteps, aiGenerateLocator,
+                    testCases, activeTab, functionalCases, pagedFunctionalCases, funcSelectedCases, funcCurrentPage, funcPageSize,
+                    getTestCases, getFunctionalCases, onTabChange, handleFuncSelectionChange,
+                    viewFuncCase, deleteFuncCase, convertToAuto, converting, exportFuncCases,
+                    submitTestCase, runTestCase, queryTask, aiGenerateSteps, aiGenerateLocator,
                     showCreateDialog, viewTestCase, editTestCase, deleteTestCase, resetForm,
                     selectedCases, batchTaskIds, batchTasks, batchPolling,
-                    handleSelectionChange, batchRun, startBatchPolling, stopBatchPolling,
+                    handleSelectionChange, batchRun, exportCases, startBatchPolling, stopBatchPolling,
                     fetchBatchTasks, statusTag,
 
                     autoGenDialogVisible, autoGenLoading, autoGenPreview, autoGenForm,
                     showAutoGenDialog, resetAutoGenForm, previewGenCases, genAndSaveCases,
 
-                    docGenDialogVisible, docGenLoading, docGenPreview, docGenForm,
-                    showDocGenDialog, resetDocGenForm, previewDocGenCases, docGenAndSaveCases,
+                    docGenDialogVisible, docGenLoading, docGenPreview, docGenForm, docGenAnalysis,
+                    showDocGenDialog, resetDocGenForm, analyzeDocGen, previewDocGenCases, docGenAndSaveCases,
                     docUploadRef, docFileList, handleDocFileChange, handleDocFileRemove,
 
                     exploratoryDialogVisible, exploratoryLoading, exploratoryPreview, exploratoryForm,
                     showExploratoryDialog, resetExploratoryForm, previewExploratoryCases, exploratoryAndSaveCases,
 
                     recordDialogVisible, recordForm, recordStatus, recordLoading, recordSteps, recordStepsText,
-                    showRecordDialog, closeRecordDialog, startRecord, stopRecord, fillRecordSteps
+                    showRecordDialog, closeRecordDialog, startRecord, stopRecord, fillRecordSteps,
+
+                    chatOpen, chatInput, chatMessages, chatLoading, chatUnread,
+                    activeRunId, runLogLines, chatMsgContainer,
+                    toggleChat, sendChat, clearChat, formatChatMsg
                 };
             }
         });

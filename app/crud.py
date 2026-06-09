@@ -74,3 +74,44 @@ def delete_test_case(db: Session, case_id: int):
 #新增批量查询函数
 def get_test_tasks_by_ids(db: Session, task_ids: list[int]):
     return db.query(models.TestTask).filter(models.TestTask.id.in_(task_ids)).all()
+
+
+# 功能测试用例CRUD
+def create_functional_case(db: Session, case: schemas.FunctionalTestCaseCreate):
+    db_case = models.FunctionalTestCase(**case.model_dump())
+    db.add(db_case)
+    db.commit()
+    db.refresh(db_case)
+    return db_case
+
+
+def get_functional_cases(db: Session, skip: int = 0, limit: int = 200):
+    return db.query(models.FunctionalTestCase).order_by(models.FunctionalTestCase.id.desc()).offset(skip).limit(limit).all()
+
+
+def get_functional_case(db: Session, case_id: int):
+    return db.query(models.FunctionalTestCase).filter(models.FunctionalTestCase.id == case_id).first()
+
+
+def update_functional_case(db: Session, case_id: int, case):
+    db_case = db.query(models.FunctionalTestCase).filter(models.FunctionalTestCase.id == case_id).first()
+    if not db_case:
+        return None
+    if hasattr(case, "model_dump"):
+        case_data = case.model_dump()
+    elif hasattr(case, "dict"):
+        case_data = case.dict()
+    else:
+        case_data = case
+    for key, value in case_data.items():
+        if hasattr(db_case, key):
+            setattr(db_case, key, value)
+    db.commit()
+    db.refresh(db_case)
+    return db_case
+
+
+def delete_functional_case(db: Session, case_id: int):
+    db_case = db.query(models.FunctionalTestCase).filter(models.FunctionalTestCase.id == case_id).delete()
+    db.commit()
+    return db_case

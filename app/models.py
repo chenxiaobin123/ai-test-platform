@@ -17,6 +17,25 @@ class TestCase(Base):
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
 
 
+# 功能测试用例表
+class FunctionalTestCase(Base):
+    __tablename__ = "functional_test_cases"
+
+    id = Column(Integer, primary_key=True, index=True)
+    case_id = Column(String(50), comment="用例编号，如TC-ORDER-001")
+    name = Column(String(200), nullable=False, comment="用例名称")
+    module = Column(String(100), comment="所属模块")
+    priority = Column(String(10), comment="优先级：P0/P1/P2/P3")
+    preconditions = Column(Text, comment="前置条件")
+    test_steps = Column(Text, comment="测试步骤（JSON数组）")
+    expected_result = Column(Text, comment="预期结果")
+    test_data = Column(Text, comment="测试数据")
+    scenario_type = Column(String(50), comment="场景类型")
+    source_url = Column(String(500), comment="来源URL")
+    created_at = Column(DateTime, default=datetime.now)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+
 # 测试任务表
 class TestTask(Base):
     __tablename__ = "test_tasks"

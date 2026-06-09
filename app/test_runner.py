@@ -206,12 +206,16 @@ def run_web_test(
                     final_log.append(f"\n⚠️ 保存定位器失败: {save_err}")
 
     # ───────── 生成 Allure 报告 ─────────
-    report_path = f"allure-report/{task_id}"
-    os.system(f"allure generate allure-results -o {report_path} --clean")
+    report_dir = f"allure-report/{task_id}"
+    os.system(f"allure generate allure-results -o {report_dir} --clean")
+
+    REPORT_BASE_URL = os.getenv("REPORT_BASE_URL", "http://localhost:8000")
+    report_url = f"{REPORT_BASE_URL}/reports/{task_id}/index.html"
+
     if final_status == "success":
-        result_msg = "\n".join(final_log) + f"\n\n✅ 测试通过！报告路径：{report_path}"
+        result_msg = "\n".join(final_log) + f"\n\n✅ 测试通过！📊 [查看报告]({report_url})"
     else:
-        result_msg = "\n".join(final_log) + f"\n\n❌ 测试失败：{last_exception}\n报告路径：{report_path}"
+        result_msg = "\n".join(final_log) + f"\n\n❌ 测试失败：{last_exception}\n📊 [查看报告]({report_url})"
 
     # ───────── 发送通知 ─────────
     try:

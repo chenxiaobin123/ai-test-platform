@@ -18,7 +18,30 @@ class TestCaseResponse(TestCaseCreate):
     updated_at: datetime
 
     class Config:
-        from_attributes = True  # 修复：orm_mode → from_attributes
+        from_attributes = True
+
+
+# 功能测试用例相关
+class FunctionalTestCaseCreate(BaseModel):
+    case_id: str = ""
+    name: str
+    module: str = ""
+    priority: str = "P1"
+    preconditions: str = ""
+    test_steps: str = "[]"
+    expected_result: str = ""
+    test_data: str = ""
+    scenario_type: str = ""
+    source_url: str = ""
+
+
+class FunctionalTestCaseResponse(FunctionalTestCaseCreate):
+    id: int
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
 
 
 # 测试任务相关
@@ -32,4 +55,4 @@ class TestTaskResponse(BaseModel):
     finished_at: Optional[datetime]
 
     class Config:
-        from_attributes = True  # 修复：orm_mode → from_attributes
+        from_attributes = True
