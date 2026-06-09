@@ -4,13 +4,73 @@ import json
 import logging
 import re
 import io
-from typing import List, Dict, Tuple
+import hashlib
+from typing import List, Dict, Tuple, Optional, Union, Any
 from functools import wraps
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 from dotenv import load_dotenv
 from openai import OpenAI, AsyncOpenAI, APITimeoutError, APIError
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError, Page, expect
 from playwright.async_api import Page as AsyncPage
+
+# ======================== 【新增】TypedDict 类型定义 ========================
+try:
+    from typing import TypedDict
+except ImportError:
+    from typing_extensions import TypedDict
+
+
+class TestStepDict(TypedDict, total=False):
+    """自动化测试步骤"""
+    action: str
+    selector: str
+    value: str
+    description: str
+
+
+class TestCaseDict(TypedDict, total=False):
+    """测试用例"""
+    name: str
+    module: str
+    priority: str
+    url: str
+    test_type: str
+    steps: List[Union[str, TestStepDict]]
+    test_steps: List[Union[str, TestStepDict]]
+    test_data: str
+    preconditions: str
+    expected_result: str
+
+
+class PageElementsDict(TypedDict, total=False):
+    """页面可交互元素"""
+    buttons: List[Dict[str, str]]
+    inputs: List[Dict[str, str]]
+    selects: List[Dict[str, str]]
+    links: List[Dict[str, str]]
+    tabs: List[Dict[str, str]]
+    menus: List[Dict[str, Any]]
+    tables: List[Dict[str, Any]]
+    forms: List[Dict[str, int]]
+    modals: List[Dict[str, Any]]
+    pageTitle: str
+
+
+class CrawlResultDict(TypedDict):
+    """页面爬取结果"""
+    url: str
+    title: str
+    elements: PageElementsDict
+
+
+class RequirementAnalysisDict(TypedDict, total=False):
+    """需求分析结果"""
+    summary: str
+    modules: List[str]
+    features: List[Dict[str, str]]
+    test_points: List[str]
+    risks: List[str]
+# ======================== 【新增结束】 ========================
 
 # ======================== 配置 ========================
 load_dotenv()
@@ -42,7 +102,102 @@ AI_MODEL = os.getenv("AI_MODEL", "gpt-4o-mini")
 MAX_RELOCATE_RETRY = int(os.getenv("MAX_RELOCATE_RETRY", "2"))
 VIEWPORT = {"width": 1920, "height": 1080}
 PAGE_LOAD_TIMEOUT = 60000
-AI_REQUEST_TIMEOUT = 90
+AI_REQUEST_TIMEOUT = 300
+
+# ======================== 【新增】统一常量管理 ========================
+# 页面加载等待
+WAIT_NETWORKIDLE_TIMEOUT = 15000
+WAIT_DOMCONTENTLOADED_TIMEOUT = 10000
+WAIT_EXTRA_TIMEOUT = 2000
+WAIT_GOTO_TIMEOUT = 60000
+# 登录等待
+WAIT_LOGIN_DIALOG_TIMEOUT = 5000
+WAIT_LOGIN_INPUT_TIMEOUT = 5000
+WAIT_LOGIN_AFTER_CLICK = 3000
+WAIT_LOGIN_AFTER_SUBMIT = 5000
+# 元素查找
+WAIT_ELEMENT_TIMEOUT = 5000
+WAIT_ELEMENT_VISIBLE_TIMEOUT = 3000
+# 重试
+MAX_RETRY_ATTEMPTS = 3
+RETRY_WAIT_BASE = 1000
+RETRY_WAIT_FACTOR = 2
+# Token限制
+MAX_HTML_LENGTH = 20000
+MAX_AI_TOKENS_DEFAULT = 4000
+MAX_AI_TOKENS_LARGE = 16000
+# 截图
+SCREENSHOT_QUALITY = 80
+SCREENSHOT_MAX_WIDTH = 1920
+# DOM提取
+DOM_EXTRACT_MAX_BUTTONS = 20
+DOM_EXTRACT_MAX_INPUTS = 30
+DOM_EXTRACT_MAX_LINKS = 15
+DOM_EXTRACT_MAX_SELECTS = 5
+DOM_EXTRACT_MAX_HEADINGS = 10
+DOM_EXTRACT_MAX_OPTIONS = 20
+# ======================== 【新增结束】 ========================
+
+# ======================== 【新增】浏览器池 / AI缓存 / DOM预处理 开关 ========================
+USE_BROWSER_POOL = os.getenv("OPT_BROWSER_POOL", "false").lower() == "true"
+USE_AI_CACHE = os.getenv("OPT_AI_CACHE", "false").lower() == "true"
+USE_DOM_PREPROCESS = os.getenv("OPT_DOM_PREPROCESS", "false").lower() == "true"
+# ======================== 【新增结束】 ========================
+
+# ======================== 【新增】统一异常体系 ========================
+class AICallError(Exception):
+    """AI API调用失败异常"""
+    pass
+
+class BrowserError(Exception):
+    """浏览器启动/操作失败异常"""
+    pass
+
+class LoginError(Exception):
+    """登录流程失败异常"""
+    pass
+
+class ElementNotFoundError(Exception):
+    """页面元素未找到异常"""
+    pass
+
+class ConfigError(Exception):
+    """配置错误异常（缺少必要环境变量等）"""
+    pass
+# ======================== 【新增结束】 ========================
+
+# 【新增】AI缓存包装函数
+def _cached_ai_chat(messages, model=None, max_tokens=None, temperature=None, timeout=None):
+    """【新增】AI调用缓存包装器。USE_AI_CACHE 为 True 时，相同请求走本地缓存"""
+    model_name = model or AI_MODEL
+    temp = temperature if temperature is not None else 0.1
+
+    cache_key = None
+    cache_data = None
+    if USE_AI_CACHE:
+        from optimizations import ai_cache
+        cache_data = json.dumps({"messages": messages, "temperature": temp}, ensure_ascii=False, sort_keys=True)
+        cache_key = hashlib.md5(cache_data.encode()).hexdigest()
+        cached = ai_cache.get(model_name, cache_key[:16], cache_data[:300])
+        if cached is not None and "content" in cached:
+            logger.info(f"🎯 AI缓存命中 ({cache_key[:12]}...)")
+            return cached["content"]
+
+    kwargs = {"model": model_name, "messages": messages}
+    if max_tokens:
+        kwargs["max_tokens"] = max_tokens
+    if temperature is not None:
+        kwargs["temperature"] = temp
+    if timeout:
+        kwargs["timeout"] = timeout
+    response = client.chat.completions.create(**kwargs)
+    content = response.choices[0].message.content.strip()
+
+    if USE_AI_CACHE and cache_key:
+        from optimizations import ai_cache
+        ai_cache.set(model_name, cache_key[:16], cache_data[:300], {"content": content})
+
+    return content
 
 # ======================== 提示词模板 ========================
 SYSTEM_PROMPT_COMMON = """
@@ -95,7 +250,7 @@ STEP_GENERATION_PROMPT = SYSTEM_PROMPT_COMMON + """
 """
 
 COMPREHENSIVE_TEST_CASE_PROMPT = """
-你是一名资深测试专家，需要根据用户提供的业务需求，生成**全面、高覆盖率**的自动化测试用例集。
+你是一名资深测试专家，需要根据用户提供的业务需求，生成**全面、高覆盖率**的功能测试用例集。
 
 【覆盖要求 —— 必须严格遵守】
 1. 每个功能点至少生成：1 条正向用例 + 至少 3 条异常/边界用例
@@ -111,16 +266,13 @@ COMPREHENSIVE_TEST_CASE_PROMPT = """
 - id：用例编号，格式 TC-{模块缩写}-{3位序号}，如 TC-ORDER-001、TC-LOGIN-002
   模块缩写根据需求自动推断，如：订单→ORDER、登录→LOGIN、客户→CUST、商品→PROD
 - name：用例名称，清晰描述测试场景（如"正向-创建销售订单"、"异常-重复提交同一订单"）
+- module：所属功能模块名称
+- priority：优先级，P0/P1/P2/P3
 - preconditions：前置条件，列出执行该用例前必须满足的条件
-- steps：符合Playwright格式的步骤数组，和之前的格式完全一致
+- test_steps：测试步骤，字符串数组，每步是清晰的中文操作描述
 - expected_result：预期结果，用中文描述操作后应该出现的现象
+- test_data：测试数据
 - scenario_type：场景类型，取值为：正向流程 / 异常操作 / 边界条件 / 权限校验
-
-【步骤生成规则 —— 与之前完全相同】
-- 使用稳定的选择器
-- 中文文本用正则处理空格
-- 最后一步必须是验证操作结果
-- 不要使用临时通知作为验证目标
 
 【输出要求】
 - 返回纯JSON数组，每个元素是一个完整的测试用例
@@ -260,8 +412,14 @@ def _fix_json_string(json_str: str) -> str:
     return s
 
 
-def extract_json_from_response(text: str) -> dict | list:
+def safe_json_loads(text: str):
+    """【新增】安全解析JSON，内置多种修复回退策略，增强鲁棒性"""
+    if not text or not isinstance(text, str):
+        return text
+
     text = text.strip()
+
+    # 清除markdown代码块
     if text.startswith("```json"):
         text = text[7:]
     elif text.startswith("```"):
@@ -269,22 +427,97 @@ def extract_json_from_response(text: str) -> dict | list:
     if text.endswith("```"):
         text = text[:-3]
     text = text.strip()
+
+    # 策略1：直接解析
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
 
-    match = re.search(r'(\[.*\]|\{.*\})', text, re.DOTALL)
-    if match:
+    # 策略2：_fix_json_string 修复
+    fixed = _fix_json_string(text)
+    try:
+        return json.loads(fixed)
+    except json.JSONDecodeError:
+        pass
+
+    # 策略3：截断修复
+    try:
+        last_brace = fixed.rfind('}')
+        last_bracket = fixed.rfind(']')
+        end_pos = max(last_brace, last_bracket)
+        if end_pos > 0:
+            truncated = fixed[:end_pos + 1]
+            if truncated.startswith('[') and not truncated.endswith(']'):
+                truncated += ']'
+            elif truncated.startswith('{') and not truncated.endswith('}'):
+                truncated += '}'
+            return json.loads(truncated)
+    except json.JSONDecodeError:
+        pass
+
+    # 策略4：括号补全
+    try:
+        brace_count = sum(1 for ch in fixed if ch == '{') - sum(1 for ch in fixed if ch == '}')
+        bracket_count = sum(1 for ch in fixed if ch == '[') - sum(1 for ch in fixed if ch == ']')
+        if fixed.startswith('[') and bracket_count > 0:
+            fixed = fixed + ']' * bracket_count
+        elif fixed.startswith('{') and brace_count > 0:
+            fixed = fixed + '}' * brace_count
+        return json.loads(fixed)
+    except json.JSONDecodeError:
+        pass
+
+    # 策略5：修复未转义换行符
+    try:
+        unescaped_fixed = re.sub(r'(?<!\\)"([^"]*?)\n([^"]*?)"', r'"\1\\n\2"', fixed)
+        unescaped_fixed = re.sub(r'(?<!\\)"([^"]*?)\t([^"]*?)"', r'"\1\\t\2"', unescaped_fixed)
+        return json.loads(unescaped_fixed)
+    except json.JSONDecodeError:
+        pass
+
+    # 所有策略失败，返回原始文本
+    logger.warning(f"   ⚠️ safe_json_loads 所有解析策略失败，返回原始文本前100字符：{text[:100]}")
+    return text
+
+
+def extract_json_from_response(text: str) -> dict | list:
+    if not text or not text.strip():
+        logger.warning("   ⚠️ AI返回内容为空，返回空数组")
+        return []
+    
+    original_text = text.strip()
+    text = original_text
+    
+    if text.startswith("```json"):
+        text = text[7:]
+    elif text.startswith("```"):
+        text = text[3:]
+    if text.endswith("```"):
+        text = text[:-3]
+    text = text.strip()
+    
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # 查找所有可能的 JSON 块
+    matches = list(re.finditer(r'(\[[\s\S]*?\]|\{[\s\S]*?\})', original_text))
+    for match in matches:
         json_str = match.group(1)
         try:
-            return json.loads(json_str)
+            result = json.loads(json_str)
+            logger.info(f"   🔧 JSON提取成功（匹配成功）")
+            return result
         except json.JSONDecodeError:
             pass
 
         fixed = _fix_json_string(json_str)
         try:
-            return json.loads(fixed)
+            result = json.loads(fixed)
+            logger.info(f"   🔧 JSON修复成功（_fix_json_string）")
+            return result
         except json.JSONDecodeError:
             pass
 
@@ -322,7 +555,68 @@ def extract_json_from_response(text: str) -> dict | list:
         except json.JSONDecodeError:
             pass
 
-    raise json.JSONDecodeError("无法解析AI返回的JSON", text, 0)
+    # 【新增策略】策略7：修复字符串内未转义的换行符和制表符
+    try:
+        fixed7 = original_text.strip()
+        if fixed7.startswith("```json"):
+            fixed7 = fixed7[7:]
+        elif fixed7.startswith("```"):
+            fixed7 = fixed7[3:]
+        if fixed7.endswith("```"):
+            fixed7 = fixed7[:-3]
+        fixed7 = fixed7.strip()
+        fixed7 = _fix_json_string(fixed7)
+        # 修复JSON字符串值内部的未转义换行符
+        fixed7 = re.sub(r'(?<!\\)"([^"]*?)\n([^"]*?)"', r'"\1\\n\2"', fixed7)
+        # 修复JSON字符串值内部的未转义制表符
+        fixed7 = re.sub(r'(?<!\\)"([^"]*?)\t([^"]*?)"', r'"\1\\t\2"', fixed7)
+        result = json.loads(fixed7)
+        logger.info(f"   🔧 JSON修复成功（换行/制表符修复）")
+        return result
+    except json.JSONDecodeError:
+        pass
+
+    # 【新增策略】策略8：尝试将单引号替换为双引号（AI偶发的错误）
+    try:
+        fixed8 = original_text.strip()
+        if fixed8.startswith("```json"):
+            fixed8 = fixed8[7:]
+        elif fixed8.startswith("```"):
+            fixed8 = fixed8[3:]
+        if fixed8.endswith("```"):
+            fixed8 = fixed8[:-3]
+        fixed8 = fixed8.strip()
+        # 只在看起来像JSON但用单引号的情况下替换
+        if fixed8.count("'") > fixed8.count('"') * 2:
+            fixed8 = re.sub(r"(?<!\\)'([^']*?)'(?=\s*[:\],\}])", r'"\1"', fixed8)
+            fixed8 = re.sub(r"(?<!\\)'([^']*?)'(?=\s*:)", r'"\1"', fixed8)
+            try:
+                result = json.loads(fixed8)
+                logger.info(f"   🔧 JSON修复成功（单引号替换）")
+                return result
+            except json.JSONDecodeError:
+                pass
+    except Exception:
+        pass
+
+    # 【新增策略】策略9：尝试修复嵌套JSON中过度转义的问题
+    try:
+        fixed9 = text.strip()
+        # 处理 \\" → \" （双重转义）
+        if '\\\\"' in fixed9:
+            try_fixed = fixed9.replace('\\\\"', '\\"')
+            try:
+                result = json.loads(try_fixed)
+                logger.info(f"   🔧 JSON修复成功（双重转义修复）")
+                return result
+            except json.JSONDecodeError:
+                pass
+    except Exception:
+        pass
+
+    # 如果所有解析都失败，返回空数组
+    logger.warning(f"   ⚠️ 无法解析JSON，返回空数组，原始内容前500字符：{original_text[:500]}")
+    return []
 
 
 def retry_api_call(func):
@@ -340,11 +634,198 @@ def retry_api_call(func):
                 import time
                 time.sleep(wait_time)
         raise Exception(f"AI API调用失败，已达最大重试次数 {max_retries}")
-
+    
     return wrapper
 
 
+# ======================== 【新增】统一工具函数 ========================
+
+def wait_for_page_load(page: Page,
+                       networkidle_timeout: int = WAIT_NETWORKIDLE_TIMEOUT,
+                       dom_timeout: int = WAIT_DOMCONTENTLOADED_TIMEOUT,
+                       extra_wait: int = WAIT_EXTRA_TIMEOUT):
+    """统一的页面加载等待策略：先等networkidle，失败则等domcontentloaded，最后固定等待"""
+    try:
+        page.wait_for_load_state("networkidle", timeout=networkidle_timeout)
+    except Exception:
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=dom_timeout)
+        except Exception:
+            pass
+    page.wait_for_timeout(extra_wait)
+
+
+def extract_interactive_elements(page: Page) -> dict:
+    """提取页面中所有可交互元素的结构化信息（新工具函数，供后续使用）"""
+    try:
+        return page.evaluate("""() => {
+            const results = {buttons: [], inputs: [], links: [], selects: [], headings: [], labels: [], forms: [], dialogs: []};
+            try {
+                document.querySelectorAll('button, [role="button"], input[type="button"], input[type="submit"]').forEach(el => {
+                    const info = {tag: el.tagName.toLowerCase(), text: (el.textContent || '').trim().substring(0, 80), id: el.id || '', type: el.getAttribute('type') || '', placeholder: el.getAttribute('placeholder') || '', ariaLabel: el.getAttribute('aria-label') || '', visible: el.offsetParent !== null};
+                    if (info.text || info.id || info.ariaLabel) results.buttons.push(info);
+                });
+                document.querySelectorAll('input:not([type="button"]):not([type="submit"]), textarea').forEach(el => {
+                    const info = {tag: el.tagName.toLowerCase(), id: el.id || '', name: el.getAttribute('name') || '', type: el.getAttribute('type') || 'text', placeholder: el.getAttribute('placeholder') || '', value: el.getAttribute('value') || '', ariaLabel: el.getAttribute('aria-label') || '', visible: el.offsetParent !== null};
+                    if (info.id || info.name || info.placeholder || info.ariaLabel) results.inputs.push(info);
+                });
+                document.querySelectorAll('a[href]').forEach(el => {
+                    const info = {text: (el.textContent || '').trim().substring(0, 80), href: el.getAttribute('href') || '', id: el.id || '', visible: el.offsetParent !== null};
+                    if (info.text && info.href) results.links.push(info);
+                });
+                document.querySelectorAll('select').forEach(el => {
+                    const options = [];
+                    el.querySelectorAll('option').forEach(opt => {options.push({text: opt.textContent.trim().substring(0, 50), value: opt.value});});
+                    results.selects.push({id: el.id || '', name: el.getAttribute('name') || '', options: options.slice(0, 20), visible: el.offsetParent !== null});
+                });
+                document.querySelectorAll('h1, h2, h3, h4, h5, h6').forEach(el => {
+                    const t = (el.textContent || '').trim();
+                    if (t) results.headings.push({tag: el.tagName.toLowerCase(), text: t.substring(0, 100)});
+                });
+                document.querySelectorAll('label').forEach(el => {
+                    const t = (el.textContent || '').trim();
+                    if (t) results.labels.push({for: el.getAttribute('for') || '', text: t.substring(0, 80)});
+                });
+                document.querySelectorAll('form').forEach(el => {
+                    results.forms.push({id: el.id || '', action: el.getAttribute('action') || '', method: el.getAttribute('method') || 'get', visible: el.offsetParent !== null});
+                });
+                document.querySelectorAll('.ant-modal, .el-dialog, [role="dialog"], .modal, [class*="login-dialog"]').forEach(el => {
+                    const t = (el.textContent || '').trim().substring(0, 200);
+                    if (t) results.dialogs.push({text: t, visible: el.offsetParent !== null});
+                });
+            } catch(e) {}
+            return results;
+        }""")
+    except Exception as e:
+        logger.warning(f"⚠️ DOM元素提取失败: {e}")
+        return {}
+
+
+def format_extracted_elements(elements: dict) -> str:
+    """将提取的元素格式化为结构化文本，供AI分析"""
+    lines = []
+    if elements.get("forms"):
+        lines.append("📋 表单:")
+        for f in elements["forms"][:5]:
+            lines.append(f'  - id={f["id"]} action={f.get("action","")} method={f.get("method","")}')
+    if elements.get("dialogs"):
+        lines.append("🪟 弹窗/对话框:")
+        for d in elements["dialogs"][:5]:
+            lines.append(f'  - {d["text"][:100]}')
+    if elements.get("inputs"):
+        lines.append("📝 输入框:")
+        for inp in elements["inputs"][:DOM_EXTRACT_MAX_INPUTS]:
+            lines.append(f'  - id={inp["id"]} name={inp.get("name","")} type={inp.get("type","")} placeholder={inp.get("placeholder","")}')
+    if elements.get("buttons"):
+        lines.append("🔘 按钮:")
+        for btn in elements["buttons"][:DOM_EXTRACT_MAX_BUTTONS]:
+            lines.append(f'  - id={btn["id"]} text={btn.get("text","")}')
+    if elements.get("selects"):
+        lines.append("📊 下拉框:")
+        for sel in elements["selects"][:DOM_EXTRACT_MAX_SELECTS]:
+            opts = ", ".join([o["text"] for o in sel.get("options", [])[:10]])
+            lines.append(f'  - id={sel["id"]} options=[{opts}]')
+    if elements.get("links"):
+        lines.append("🔗 链接:")
+        for link in elements["links"][:DOM_EXTRACT_MAX_LINKS]:
+            lines.append(f'  - href={link["href"]} text={link.get("text","")}')
+    if elements.get("headings"):
+        lines.append("📌 标题:")
+        for h in elements["headings"][:DOM_EXTRACT_MAX_HEADINGS]:
+            lines.append(f'  - {h["tag"]}: {h["text"]}')
+    return "\n".join(lines)
+
+
+def preprocess_dom_for_ai(html_content: str, max_length: int = MAX_HTML_LENGTH) -> str:
+    """预处理DOM内容，过滤无用标签和属性，减少AI Token消耗（新工具函数，供后续使用）"""
+    cleaned = re.sub(r'<script[^>]*>[\s\S]*?</script>', '', html_content, flags=re.IGNORECASE)
+    cleaned = re.sub(r'<style[^>]*>[\s\S]*?</style>', '', cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'<noscript[^>]*>[\s\S]*?</noscript>', '', cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'<!--[\s\S]*?-->', '', cleaned)
+    cleaned = re.sub(r'<svg[^>]*>[\s\S]*?</svg>', '', cleaned, flags=re.IGNORECASE)
+    useless_attrs = r'\s+(?:data-v-[a-f0-9]+|data-reactid|data-reactroot|aria-\w+|on\w+|role|tabindex|style|class)="[^"]*"'
+    cleaned = re.sub(useless_attrs, '', cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'\n\s*\n', '\n', cleaned)
+    cleaned = re.sub(r'>\s+<', '><', cleaned)
+    if len(cleaned) > max_length:
+        cleaned = cleaned[:max_length]
+    logger.info(f"   🧹 DOM预处理: {len(html_content)} → {len(cleaned)} 字符")
+    return cleaned
+
+
+def mask_sensitive_info(text: str) -> str:
+    """【新增】敏感信息脱敏，防止密码、手机号、邮箱、API密钥等泄露到日志"""
+    if not isinstance(text, str):
+        return text
+    # 密码脱敏: password=xxx, "password":"xxx", passwd=xxx
+    text = re.sub(r'(password[\s=:]+["\']?)([^"\'&\s]+)(["\']?)', r'\1***MASKED***\3', text, flags=re.IGNORECASE)
+    text = re.sub(r'(passwd[\s=:]+["\']?)([^"\'&\s]+)', r'\1***MASKED***', text, flags=re.IGNORECASE)
+    # 手机号脱敏: 1[3-9]xxxxxxxxx
+    text = re.sub(r'1[3-9]\d{9}', lambda m: m.group()[:3] + '****' + m.group()[-4:], text)
+    # 邮箱脱敏: user@example.com
+    text = re.sub(r'([\w.-]+)@([\w.-]+\.\w+)', r'\1***@\2', text)
+    # API密钥脱敏: sk-xxx
+    text = re.sub(r'(sk-[A-Za-z0-9]{10,})', r'sk-***MASKED***', text)
+    # secret/secret_key脱敏
+    text = re.sub(r'(secret[_]?key[\s=:]+["\']?)([^"\'&\s]+)', r'\1***MASKED***', text, flags=re.IGNORECASE)
+    return text
+
+
+# ======================== 【新增】LoginConfig 数据类 ========================
+from dataclasses import dataclass
+
+
+@dataclass
+class LoginConfig:
+    """登录相关参数封装（新数据类，供后续使用）"""
+    login_url: str = ""
+    username: str = ""
+    password: str = ""
+    username_selector: str = ""
+    password_selector: str = ""
+    submit_selector: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "login_url": self.login_url, "username": self.username,
+            "password": self.password, "username_selector": self.username_selector,
+            "password_selector": self.password_selector, "submit_selector": self.submit_selector,
+        }
+
+    def is_configured(self) -> bool:
+        return bool(self.login_url and self.username and self.password)
+
+
+# ======================== 【新增结束】 ========================
+
+
 def capture_page_context(url: str) -> Tuple[str, str, str]:
+    # 【新增】浏览器池模式：复用浏览器实例，避免频繁启动关闭
+    if USE_BROWSER_POOL:
+        from optimizations import browser_pool
+        _, browser, context, page = browser_pool.acquire(headless=True)
+        try:
+            page.goto(url, timeout=PAGE_LOAD_TIMEOUT)
+            try:
+                page.wait_for_load_state("networkidle", timeout=WAIT_NETWORKIDLE_TIMEOUT)
+            except Exception:
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=WAIT_DOMCONTENTLOADED_TIMEOUT)
+                except Exception:
+                    pass
+            page.wait_for_timeout(WAIT_EXTRA_TIMEOUT)
+            title = page.title()
+            html = page.content()[:MAX_HTML_LENGTH]
+            if USE_DOM_PREPROCESS:
+                from .optimizations import preprocess_dom_for_ai
+                html = preprocess_dom_for_ai(html)
+            screenshot = page.screenshot(full_page=True, type="png")
+            screenshot_b64 = base64.b64encode(screenshot).decode("utf-8")
+            return title, html, screenshot_b64
+        finally:
+            browser_pool.release(page)
+
+    # === 原始逻辑（保持不变） ===
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(viewport=VIEWPORT)
@@ -361,6 +842,9 @@ def capture_page_context(url: str) -> Tuple[str, str, str]:
             page.wait_for_timeout(2000)
             title = page.title()
             html = page.content()[:20000]
+            if USE_DOM_PREPROCESS:
+                from optimizations import preprocess_dom_for_ai
+                html = preprocess_dom_for_ai(html)
             screenshot = page.screenshot(full_page=True, type="png")
             screenshot_b64 = base64.b64encode(screenshot).decode("utf-8")
             return title, html, screenshot_b64
@@ -389,19 +873,51 @@ async def capture_current_page_context_async(page: AsyncPage) -> Tuple[str, str]
 
 def validate_locators_on_page(url: str, selector_str: str) -> List[str]:
     valid = []
+    # 【新增】浏览器池模式
+    if USE_BROWSER_POOL:
+        from optimizations import browser_pool
+        _, browser, context, page = browser_pool.acquire(headless=True)
+        try:
+            page.goto(url, timeout=PAGE_LOAD_TIMEOUT)
+            try:
+                page.wait_for_load_state("networkidle", timeout=WAIT_NETWORKIDLE_TIMEOUT)
+            except Exception:
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=WAIT_DOMCONTENTLOADED_TIMEOUT)
+                except Exception:
+                    pass
+            page.wait_for_timeout(WAIT_EXTRA_TIMEOUT)
+            for sel in _split_selectors(selector_str):
+                sel = clean_selector(sel)
+                if not sel:
+                    continue
+                try:
+                    count = page.locator(sel).count()
+                    if count == 1:
+                        valid.append(sel)
+                        logger.info(f"   ✅ 验证通过: {sel}")
+                    elif count > 1:
+                        logger.warning(f"   ⚠️ 匹配{count}个: {sel}")
+                except Exception as e:
+                    logger.warning(f"   ⚠️ 选择器无效: {sel} -> {e}")
+        finally:
+            browser_pool.release(page)
+        return valid
+
+    # === 原始逻辑（保持不变） ===
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page(viewport=VIEWPORT)
         try:
             page.goto(url, timeout=PAGE_LOAD_TIMEOUT)
             try:
-                page.wait_for_load_state("networkidle", timeout=15000)
+                page.wait_for_load_state("networkidle", timeout=WAIT_NETWORKIDLE_TIMEOUT)
             except Exception:
                 try:
-                    page.wait_for_load_state("domcontentloaded", timeout=10000)
+                    page.wait_for_load_state("domcontentloaded", timeout=WAIT_DOMCONTENTLOADED_TIMEOUT)
                 except Exception:
                     pass
-            page.wait_for_timeout(2000)
+            page.wait_for_timeout(WAIT_EXTRA_TIMEOUT)
             for sel in _split_selectors(selector_str):
                 sel = clean_selector(sel)
                 if not sel:
@@ -513,8 +1029,7 @@ def ai_generate_test_steps(url: str, requirement: str) -> List[Dict]:
     logger.info(f"🤖 生成测试步骤: {requirement[:100]}...")
     try:
         title, dom, _ = capture_page_context(url)
-        response = client.chat.completions.create(
-            model=AI_MODEL,
+        ai_text = _cached_ai_chat(
             messages=[
                 {"role": "system", "content": STEP_GENERATION_PROMPT},
                 {
@@ -528,11 +1043,11 @@ def ai_generate_test_steps(url: str, requirement: str) -> List[Dict]:
                     )
                 }
             ],
+            model=AI_MODEL,
             max_tokens=2500,
             temperature=0.1,
             timeout=AI_REQUEST_TIMEOUT
         )
-        ai_text = response.choices[0].message.content.strip()
         steps = extract_json_from_response(ai_text)
         if isinstance(steps, dict):
             steps = steps.get("steps", [])
@@ -570,8 +1085,7 @@ def ai_generate_comprehensive_test_cases(url: str, requirement: str) -> List[Dic
     logger.info(f"🤖 生成多场景用例: {requirement[:100]}...")
     try:
         title, dom, _ = capture_page_context(url)
-        response = client.chat.completions.create(
-            model=AI_MODEL,
+        ai_text = _cached_ai_chat(
             messages=[
                 {"role": "system", "content": COMPREHENSIVE_TEST_CASE_PROMPT},
                 {
@@ -584,33 +1098,36 @@ def ai_generate_comprehensive_test_cases(url: str, requirement: str) -> List[Dic
                     )
                 }
             ],
+            model=AI_MODEL,
             max_tokens=3500,
             temperature=0.1,
             timeout=AI_REQUEST_TIMEOUT
         )
-        ai_text = response.choices[0].message.content.strip()
         test_cases = extract_json_from_response(ai_text)
         if isinstance(test_cases, dict):
             test_cases = test_cases.get("test_cases", [])
         valid_cases = []
         for case in test_cases:
-            if not case.get("name") or not case.get("steps"):
+            if not case.get("name"):
                 continue
-            valid_steps = []
-            for step in case["steps"]:
-                if not step.get("action") or not step.get("selector"):
-                    continue
-                if step.get("action") not in ("fill", "click", "wait_for_selector", "assert_text"):
-                    continue
-                if step.get("action") in ("fill", "assert_text") and not step.get("value"):
-                    continue
-                valid_steps.append(step)
-            if valid_steps:
-                case["steps"] = valid_steps
-                case["url"] = url
-                case["test_type"] = "web"
-                valid_cases.append(case)
-        logger.info(f"✅ 成功生成{len(valid_cases)}个有效测试用例")
+            test_steps = case.get("test_steps", case.get("steps", []))
+            if isinstance(test_steps, str):
+                test_steps = [test_steps]
+            if not test_steps:
+                continue
+            case["steps"] = test_steps
+            case["url"] = url
+            case["test_type"] = "web"
+            if "test_steps" not in case:
+                case["test_steps"] = test_steps
+            if "module" not in case:
+                case["module"] = ""
+            if "priority" not in case:
+                case["priority"] = "P1"
+            if "test_data" not in case:
+                case["test_data"] = ""
+            valid_cases.append(case)
+        logger.info(f"✅ 成功生成{len(valid_cases)}个功能测试用例")
         return valid_cases
     except Exception as e:
         logger.error(f"❌ 生成多场景测试用例失败: {e}", exc_info=True)
@@ -1288,7 +1805,7 @@ async def generate_smart_assertion_async(page: AsyncPage, cleaned_steps: list[di
         result_text = response.choices[0].message.content.strip()
         if result_text.startswith("```json"):
             result_text = result_text[7:-3]
-        assertion = json.loads(result_text)
+        assertion = safe_json_loads(result_text)
         assertion["action"] = "assert_text"
         if "selector" not in assertion or not assertion["selector"]:
             assertion["selector"] = "body"
@@ -1310,14 +1827,7 @@ async def generate_smart_assertion_async(page: AsyncPage, cleaned_steps: list[di
 
 
 # 保留同步占位函数
-def generate_smart_assertion(page: Page, cleaned_steps: list[dict]) -> dict:
-    logger.warning("generate_smart_assertion 同步版暂不推荐用于录制，请使用 generate_smart_assertion_async")
-    return {
-        "action": "assert_text",
-        "selector": "body",
-        "value": "",
-        "description": "同步版本占位，请使用异步版本"
-    }
+
 
 
 # ======================== 需求/文档解析生成测试用例 ========================
@@ -1435,13 +1945,133 @@ def _extract_swagger_text(data: dict) -> str:
 
 def fetch_url_content(url: str, login_url: str = "", login_username: str = "",
                       login_password: str = "", login_username_selector: str = "",
-                      login_password_selector: str = "", login_submit_selector: str = "") -> str:
-    """抓取网页URL，提取可见文本内容和交互元素描述。支持先登录再抓取。"""
+                      login_password_selector: str = "", login_submit_selector: str = "",
+                      manual_login: bool = False) -> str:
+    """抓取网页URL，提取可见文本内容和交互元素描述。支持先登录再抓取。
+    manual_login=True时打开可见浏览器，用户手动登录后点击页面上的"继续"按钮。
+    支持session持久化，避免重复登录。
+    """
     logger.info(f"🌐 抓取网页内容: {url}")
+    
+    # 解析URL获取域名作为session标识
+    import hashlib
+    url_parsed = __import__('urllib.parse').parse.urlparse(url)
+    domain = url_parsed.netloc or 'default'
+    session_file = f".browser_session_{hashlib.md5(domain.encode()).hexdigest()}.json"
+    logger.info(f"   🔑 Session文件: {session_file}")
+    
+    headless = not manual_login
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(viewport=VIEWPORT)
+        browser = p.chromium.launch(headless=headless)
+        
+        # 尝试恢复已保存的session
+        storage_state = None
+        if __import__('os').path.exists(session_file):
+            try:
+                with open(session_file, 'r', encoding='utf-8') as f:
+                    storage_state = __import__('json').load(f)
+                logger.info(f"   ✅ 恢复已保存的Session")
+            except Exception as e:
+                logger.info(f"   ⚠️ 恢复Session失败: {e}")
+        
+        context = browser.new_context(viewport=VIEWPORT, storage_state=storage_state)
         page = context.new_page()
+
+        if manual_login:
+            try:
+                logger.info(f"   🖐️ 手动登录模式：打开可见浏览器，请手动登录...")
+                page.goto(url, timeout=PAGE_LOAD_TIMEOUT)
+                try:
+                    page.wait_for_load_state("networkidle", timeout=15000)
+                except Exception:
+                    try:
+                        page.wait_for_load_state("domcontentloaded", timeout=10000)
+                    except Exception:
+                        pass
+                page.wait_for_timeout(2000)
+
+                # 注入"继续"按钮，供用户登录完成后点击
+                page.evaluate("""() => {
+                    if (document.getElementById('__manual_login_done__')) return;
+                    const div = document.createElement('div');
+                    div.id = '__manual_login_done__';
+                    div.innerHTML = `
+                        <div style="position:fixed;top:10px;right:10px;z-index:999999;
+                            background:#1890ff;color:#fff;padding:12px 24px;border-radius:8px;
+                            cursor:pointer;font-size:16px;font-weight:bold;box-shadow:0 4px 12px rgba(0,0,0,0.3);
+                            display:flex;align-items:center;gap:8px;font-family:sans-serif;">
+                            <span>✅</span> 登录完成，点击继续抓取
+                        </div>
+                    `;
+                    div.addEventListener('click', () => {
+                        div.innerHTML = '<div style="padding:12px 24px;background:#52c41a;color:#fff;border-radius:8px;font-size:16px;">⏳ 正在抓取页面内容...</div>';
+                        window.__manual_login_done = true;
+                    });
+                    document.body.appendChild(div);
+                }""")
+
+                logger.info(f"   🖐️ 等待手动登录完成（点击右上角蓝色按钮）...")
+                # 等待用户点击"继续"按钮，最多等5分钟
+                try:
+                    page.wait_for_function("window.__manual_login_done === true", timeout=300000)
+                    logger.info(f"   ✅ 手动登录完成，开始抓取页面内容")
+                except Exception:
+                    logger.warning(f"   ⚠️ 手动登录超时（5分钟），将尝试直接抓取")
+
+                # 移除注入的UI元素，避免干扰内容提取
+                try:
+                    page.evaluate("""() => {
+                        const el = document.getElementById('__manual_login_done__');
+                        if (el) el.remove();
+                        delete window.__manual_login_done;
+                    }""")
+                except Exception:
+                    pass
+
+                page.wait_for_timeout(3000)
+                try:
+                    page.wait_for_load_state("networkidle", timeout=15000)
+                except Exception:
+                    pass
+                page.wait_for_timeout(2000)
+
+                # 保存登录后的Session
+                try:
+                    context.storage_state(path=session_file)
+                    logger.info(f"   💾 Session已保存到文件")
+                except Exception as e:
+                    logger.info(f"   ⚠️ 保存Session失败: {e}")
+
+                # 提取内容（含截图用于canvas/SVG页面）
+                result = _extract_page_content(page)
+
+                # 如果DOM文本内容过少，尝试遍历iframe和Modao页面树
+                if len(result) < 500:
+                    logger.info(f"   📊 DOM内容过少，尝试深度提取...")
+                    iframe_content = _extract_from_iframes(page)
+                    if iframe_content:
+                        result = result + "\n\n## iframe内容\n" + iframe_content
+
+                    # 尝试提取Modao原型页面树
+                    try:
+                        modao_content = _extract_modao_prototype_content(page)
+                        if modao_content:
+                            result = result + "\n\n## 原型页面结构\n" + modao_content
+                    except Exception as e:
+                        logger.info(f"   ⚡ Modao提取失败: {e}")
+
+                return result
+
+            except Exception as e:
+                logger.error(f"   ❌ 手动登录模式异常: {e}")
+                raise
+            finally:
+                browser.close()
+                try:
+                    p.stop()
+                except Exception:
+                    pass
+
         try:
             same_page_login = False
             if login_url and login_username and login_password:
@@ -1517,13 +2147,1007 @@ def fetch_url_content(url: str, login_url: str = "", login_username: str = "",
                         except Exception:
                             pass
 
-            result = page.evaluate("""() => {
+            # 保存Session
+            try:
+                context.storage_state(path=session_file)
+                logger.info(f"   💾 Session已保存到文件")
+            except Exception as e:
+                logger.info(f"   ⚠️ 保存Session失败: {e}")
+
+            result = _extract_page_content(page)
+
+            # 如果DOM文本内容过少，尝试遍历iframe和Modao页面树
+            if len(result) < 500:
+                logger.info(f"   📊 DOM内容过少，尝试深度提取...")
+                iframe_content = _extract_from_iframes(page)
+                if iframe_content:
+                    result = result + "\n\n## iframe内容\n" + iframe_content
+                try:
+                    modao_content = _extract_modao_prototype_content(page)
+                    if modao_content:
+                        result = result + "\n\n## 原型页面结构\n" + modao_content
+                except Exception as e:
+                    logger.info(f"   ⚡ Modao提取失败: {e}")
+
+            return result
+
+        finally:
+            browser.close()
+
+
+def _extract_from_iframes(page) -> str:
+    """从页面所有iframe中提取文本内容"""
+    contents = []
+    try:
+        frames = page.frames
+        for frame in frames[1:]:  # 跳过主frame
+            try:
+                frame_text = frame.evaluate("""() => {
+                    const texts = [];
+                    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+                    let node;
+                    while (node = walker.nextNode()) {
+                        const t = node.textContent.trim();
+                        if (t && t.length > 1) texts.push(t);
+                    }
+                    const buttons = [];
+                    document.querySelectorAll('button, [role="button"], a, [class*="btn"]').forEach(el => {
+                        const t = (el.textContent || '').trim().slice(0, 50);
+                        if (t) buttons.push(t);
+                    });
+                    const inputs = [];
+                    document.querySelectorAll('input:not([type="hidden"]), textarea, select').forEach(el => {
+                        const ph = el.placeholder || el.name || '';
+                        if (ph) inputs.push(ph);
+                    });
+                    return {
+                        url: window.location.href.slice(0, 200),
+                        texts: [...new Set(texts)].slice(0, 200),
+                        buttons: [...new Set(buttons)].slice(0, 50),
+                        inputs: [...new Set(inputs)].slice(0, 30)
+                    };
+                }""")
+                url = frame_text.get('url', '')
+                texts = frame_text.get('texts', [])
+                buttons = frame_text.get('buttons', [])
+                inputs = frame_text.get('inputs', [])
+                if texts or buttons or inputs:
+                    section = f"### iframe: {url[:80]}\n"
+                    if texts:
+                        section += "文本: " + " | ".join(texts[:50]) + "\n"
+                    if buttons:
+                        section += "按钮: " + " | ".join(buttons[:20]) + "\n"
+                    if inputs:
+                        section += "输入框: " + " | ".join(inputs[:15]) + "\n"
+                    contents.append(section)
+                    logger.info(f"   📋 iframe内容: {url[:60]} - {len(texts)}文本, {len(buttons)}按钮")
+            except Exception as e:
+                logger.info(f"   ⚡ iframe访问失败: {e}")
+                continue
+    except Exception:
+        pass
+    return "\n".join(contents)
+
+
+def _extract_from_screenshot(page) -> str:
+    """截图页面并用AI分析截图内容（用于canvas/SVG渲染的页面）"""
+    try:
+        import tempfile, os
+        # 截取全页面截图
+        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
+            tmp_path = tmp.name
+        page.screenshot(path=tmp_path, full_page=True, timeout=30000)
+        file_size = os.path.getsize(tmp_path)
+        logger.info(f"   📸 页面截图: {file_size} bytes")
+
+        if file_size < 1000:
+            os.unlink(tmp_path)
+            return ""
+
+        # 读取截图为base64
+        with open(tmp_path, 'rb') as f:
+            img_data = f.read()
+        os.unlink(tmp_path)
+
+        import base64
+        img_b64 = base64.b64encode(img_data).decode('utf-8')
+
+        # 如果截图太大，压缩或截取
+        if len(img_b64) > 4000000:  # ~4MB base64
+            logger.info(f"   📸 截图过大({len(img_b64)} chars)，尝试viewport截图")
+            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
+                tmp_path = tmp.name
+            page.screenshot(path=tmp_path, full_page=False, timeout=30000)
+            with open(tmp_path, 'rb') as f:
+                img_data = f.read()
+            os.unlink(tmp_path)
+            img_b64 = base64.b64encode(img_data).decode('utf-8')
+
+        # 调用AI视觉模型分析截图
+        logger.info(f"   🤖 发送截图给AI分析...")
+        try:
+            response = client.chat.completions.create(
+                model=AI_MODEL,
+                messages=[
+                    {"role": "system", "content": "你是一个网页内容分析专家。请分析截图中的网页内容，提取所有可见的文本、按钮、输入框、菜单、链接等UI元素，以及页面的功能描述。用结构化的方式输出。"},
+                    {"role": "user", "content": [
+                        {"type": "text", "text": "请分析这个网页截图，提取所有可见的UI元素和功能描述。包括：1.页面标题和主要文本内容 2.所有按钮和可点击元素 3.输入框和表单字段 4.菜单和导航项 5.页面的主要功能描述"},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}
+                    ]}
+                ],
+                max_tokens=4000,
+                timeout=AI_REQUEST_TIMEOUT
+            )
+            desc = response.choices[0].message.content.strip()
+            logger.info(f"   ✅ AI截图分析完成: {len(desc)} 字符")
+            return desc
+        except Exception as e:
+            logger.info(f"   ⚡ AI视觉分析失败: {e}")
+            # 如果AI视觉失败，返回截图存在的信息
+            return f"[页面截图已保存，大小{file_size}字节，但AI视觉分析不可用。页面可能包含canvas/SVG渲染的内容。]"
+
+    except Exception as e:
+        logger.info(f"   ⚡ 截图提取失败: {e}")
+        return ""
+
+
+def _extract_modao_prototype_content(page) -> str:
+    """从墨刀原型页面提取页面树结构和内容"""
+    lines = []
+    try:
+        # 1. 先尝试直接提取已展开的页面树
+        page_tree = page.evaluate("""() => {
+            const result = { treePages: [], svgTexts: [], canvasTexts: [], viewerTexts: [] };
+
+            // 提取页面树 - 墨刀左侧页面列表
+            const pageTreeSelectors = [
+                '[class*="page-tree"]', '[class*="pageTree"]', '[class*="pagetree"]',
+                '[class*="page-list"]', '[class*="pageList"]', '[class*="pagelist"]',
+                '[class*="tree"] li', '[class*="tree"] [class*="item"]',
+                '[class*="left-panel"] [class*="item"]', '[class*="leftPanel"] [class*="item"]',
+                '[class*="sidebar"] [class*="page"]', '[class*="sidebar"] [class*="item"]',
+                '[class*="sider"] [class*="page"]', '[class*="sider"] [class*="item"]',
+                // 墨刀分享页面特定选择器
+                '[class*="panel"] [class*="page-item"]', '[class*="panel"] [class*="pageItem"]',
+                '.page-item', '.pageItem',
+                '[class*="page-name"]', '[class*="pageName"]',
+                // 墨刀查看器页面下拉
+                '[class*="page-select"]', '[class*="pageSelect"]',
+                '[class*="dropdown"] [class*="page"]',
+            ];
+
+            for (const sel of pageTreeSelectors) {
+                try {
+                    const els = document.querySelectorAll(sel);
+                    if (els.length > 0) {
+                        els.forEach(el => {
+                            const t = (el.textContent || '').trim();
+                            if (t && t.length > 1 && t.length < 200) {
+                                result.treePages.push(t);
+                            }
+                        });
+                    }
+                } catch(e) {}
+            }
+
+            // 提取SVG中的文本
+            const svgs = document.querySelectorAll('svg text, svg tspan');
+            svgs.forEach(el => {
+                const t = (el.textContent || '').trim();
+                if (t && t.length > 1) result.svgTexts.push(t);
+            });
+
+            // 提取canvas的alt/title
+            const canvases = document.querySelectorAll('canvas');
+            canvases.forEach(el => {
+                const alt = el.getAttribute('aria-label') || el.getAttribute('alt') || '';
+                if (alt) result.canvasTexts.push(alt);
+            });
+
+            // 提取主查看器区域内容
+            const viewerSelectors = [
+                '[class*="viewer"]', '[class*="preview"]', '[class*="prototype"]',
+                '[class*="canvas"]', '[class*="stage"]', '[class*="screen"]',
+                '[class*="content"]', 'main', '[role="main"]'
+            ];
+            for (const sel of viewerSelectors) {
+                try {
+                    const el = document.querySelector(sel);
+                    if (el) {
+                        const texts = [];
+                        const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+                        let node;
+                        while (node = walker.nextNode()) {
+                            const t = node.textContent.trim();
+                            if (t && t.length > 1 && t.length < 200) texts.push(t);
+                        }
+                        if (texts.length > 0) {
+                            result.viewerTexts = [...new Set(texts)].slice(0, 100);
+                            break;
+                        }
+                    }
+                } catch(e) {}
+            }
+
+            return result;
+        }""")
+
+        if page_tree.get('treePages'):
+            unique_pages = list(dict.fromkeys(page_tree['treePages']))
+            lines.append("### 原型页面列表")
+            for p in unique_pages:
+                lines.append(f"- {p}")
+            logger.info(f"   📋 提取到 {len(unique_pages)} 个原型页面")
+
+        if page_tree.get('svgTexts'):
+            unique_svg = list(dict.fromkeys(page_tree['svgTexts']))
+            lines.append("\n### SVG文本内容")
+            for t in unique_svg[:50]:
+                lines.append(f"- {t}")
+            logger.info(f"   📐 提取到 {len(unique_svg)} 个SVG文本")
+
+        if page_tree.get('canvasTexts'):
+            lines.append("\n### Canvas描述")
+            for t in page_tree['canvasTexts']:
+                lines.append(f"- {t}")
+
+        if page_tree.get('viewerTexts'):
+            unique_viewer = list(dict.fromkeys(page_tree['viewerTexts']))
+            lines.append("\n### 查看器内容")
+            for t in unique_viewer[:50]:
+                lines.append(f"- {t}")
+            logger.info(f"   👁️ 提取到 {len(unique_viewer)} 个查看器文本")
+
+        # 2. 如果页面树为空，尝试点击"页面"按钮展开
+        if not page_tree.get('treePages') and not page_tree.get('svgTexts') and not page_tree.get('viewerTexts'):
+            logger.info(f"   🔍 未找到页面树，尝试点击'页面'按钮...")
+            try:
+                # 查找并点击"页面"按钮
+                page_btn_clicked = page.evaluate("""() => {
+                    const selectors = [
+                        'text="页面"', 'span:has-text("页面")', 'button:has-text("页面")',
+                        '[class*="page"]:has-text("页面")', 'div:has-text("页面")',
+                        '[title="页面"]', '[aria-label="页面"]',
+                        'button', '[role="button"]', '[class*="btn"]', '[class*="tab"]',
+                        '.toolbar-item', '[class*="toolbar"] *'
+                    ];
+
+                    // 先精确匹配"页面"文本
+                    const allElements = document.querySelectorAll('*');
+                    let found = null;
+                    for (const el of allElements) {
+                        if (el.children.length === 0 || el.children.length <= 1) {
+                            const t = (el.textContent || '').trim();
+                            if (t === '页面' || t === '頁面') {
+                                found = el;
+                                break;
+                            }
+                        }
+                    }
+                    if (found) {
+                        found.click();
+                        found.dispatchEvent(new MouseEvent('click', {bubbles: true, composed: true}));
+                        found.dispatchEvent(new PointerEvent('pointerdown', {bubbles: true, composed: true}));
+                        found.dispatchEvent(new PointerEvent('pointerup', {bubbles: true, composed: true}));
+                        return 'clicked:' + (found.textContent || '').trim();
+                    }
+                    return 'not_found';
+                }""")
+                logger.info(f"   🔍 页面按钮点击结果: {page_btn_clicked}")
+
+                if page_btn_clicked.startswith('clicked'):
+                    page.wait_for_timeout(2000)
+
+                    # 重新提取页面树
+                    page_tree2 = page.evaluate("""() => {
+                        const pages = [];
+                        const selectors = [
+                            '[class*="page-tree"] *', '[class*="pageTree"] *', '[class*="pagetree"] *',
+                            '[class*="page-list"] *', '[class*="pageList"] *', '[class*="pagelist"] *',
+                            '[class*="tree"] li', '[class*="tree"] [class*="item"]',
+                            '[class*="left-panel"] [class*="item"]', '[class*="leftPanel"] [class*="item"]',
+                            '[class*="sidebar"] [class*="page"]', '[class*="sidebar"] [class*="item"]',
+                            '[class*="panel"] [class*="page-item"]', '[class*="panel"] [class*="pageItem"]',
+                            '.page-item', '.pageItem', '[class*="page-name"]', '[class*="pageName"]',
+                            '[class*="dropdown"] [class*="page"]', '[class*="select"] [class*="page"]',
+                            '[class*="menu"] [class*="page"]', '[class*="menu"] [class*="item"]',
+                        ];
+                        for (const sel of selectors) {
+                            try {
+                                document.querySelectorAll(sel).forEach(el => {
+                                    const t = (el.textContent || '').trim();
+                                    if (t && t.length > 1 && t.length < 200) pages.push(t);
+                                });
+                            } catch(e) {}
+                        }
+                        // 如果还没找到，扫描所有可见文本
+                        if (pages.length === 0) {
+                            const all = document.querySelectorAll('*');
+                            for (const el of all) {
+                                if (el.children.length === 0) {
+                                    const t = (el.textContent || '').trim();
+                                    if (t && t.length > 2 && t.length < 100) pages.push(t);
+                                }
+                            }
+                        }
+                        return [...new Set(pages)];
+                    }""")
+
+                    if page_tree2:
+                        unique_pages2 = list(dict.fromkeys(page_tree2))
+                        # 过滤掉明显不是页面名的文本
+                        page_names = [p for p in unique_pages2 if len(p) > 2 and len(p) < 100
+                                      and not p.startswith('<') and not p.startswith('{')
+                                      and not p.startswith('function') and not p.startswith('var ')
+                                      and not p.startswith('const ') and not p.startswith('let ')
+                                      and not p.startswith('import ') and not p.startswith('export ')
+                                      and p not in ['页面', '頁面', '图层', '圖層', '组件', '組件',
+                                                    '状态', '狀態', '交互', '交互', '预览', '預覽']]
+                        if page_names:
+                            lines.append("### 原型页面列表（点击展开后）")
+                            for p in page_names[:100]:
+                                lines.append(f"- {p}")
+                            logger.info(f"   📋 点击展开后提取到 {len(page_names)} 个页面")
+            except Exception as e:
+                logger.info(f"   ⚡ 点击'页面'按钮失败: {e}")
+
+        # 3. 如果所有尝试都失败，提取页面所有可见文本作为兜底
+        if not lines:
+            logger.info(f"   🔍 所有提取方式均失败，使用全页面文本提取...")
+            all_texts = page.evaluate("""() => {
+                const texts = [];
+                const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+                let node;
+                while (node = walker.nextNode()) {
+                    const t = node.textContent.trim();
+                    if (t && t.length > 1 && t.length < 200) texts.push(t);
+                }
+                return [...new Set(texts)].slice(0, 200);
+            }""")
+            if all_texts:
+                lines.append("### 页面全部可见文本")
+                for t in all_texts:
+                    lines.append(f"- {t}")
+                logger.info(f"   📝 全页面提取到 {len(all_texts)} 个文本")
+
+    except Exception as e:
+        logger.info(f"   ⚡ Modao原型提取异常: {e}")
+
+    return '\n'.join(lines) if lines else ""
+
+
+def traverse_modao_pages(url: str, manual_login: bool = False) -> Dict:
+    """遍历墨刀原型的所有页面，收集每个页面的内容
+    
+    Returns:
+        {
+            "success": bool,
+            "pages": [{"name": "页面名称", "content": "页面内容"}],
+            "all_content": "所有页面合并内容"
+        }
+    """
+    logger.info(f"🔍 开始遍历墨刀原型页面: {url}")
+    
+    import hashlib
+    url_parsed = __import__('urllib.parse').parse.urlparse(url)
+    domain = url_parsed.netloc or 'default'
+    session_file = f".browser_session_{hashlib.md5(domain.encode()).hexdigest()}.json"
+    
+    pages_collected = []
+    
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=not manual_login)
+            
+            storage_state = None
+            if __import__('os').path.exists(session_file):
+                try:
+                    with open(session_file, 'r', encoding='utf-8') as f:
+                        storage_state = __import__('json').load(f)
+                    logger.info(f"   ✅ 恢复已保存的Session")
+                except Exception as e:
+                    logger.info(f"   ⚠️ 恢复Session失败: {e}")
+            
+            context = browser.new_context(viewport=VIEWPORT, storage_state=storage_state)
+            page = context.new_page()
+            
+            # 先访问目标页面
+            page.goto(url, timeout=PAGE_LOAD_TIMEOUT)
+            try:
+                page.wait_for_load_state("networkidle", timeout=15000)
+            except Exception:
+                pass
+            page.wait_for_timeout(2000)
+            
+            # 如果是手动登录模式，让用户先登录
+            if manual_login:
+                logger.info(f"   🖐️ 请在浏览器中完成登录，然后点击右上角蓝色按钮继续")
+                page.evaluate("""() => {
+                    if (document.getElementById('__manual_login_done__')) return;
+                    const div = document.createElement('div');
+                    div.id = '__manual_login_done__';
+                    div.innerHTML = `
+                        <div style="position:fixed;top:10px;right:10px;z-index:999999;
+                            background:#1890ff;color:#fff;padding:12px 24px;border-radius:8px;
+                            cursor:pointer;font-size:16px;font-weight:bold;box-shadow:0 4px 12px rgba(0,0,0,0.3);
+                            display:flex;align-items:center;gap:8px;font-family:sans-serif;">
+                            <span>✅</span> 登录完成，点击开始遍历
+                        </div>
+                    `;
+                    div.addEventListener('click', () => {
+                        div.innerHTML = '<div style="padding:12px 24px;background:#52c41a;color:#fff;border-radius:8px;font-size:16px;">⏳ 正在遍历页面...</div>';
+                        window.__manual_login_done = true;
+                    });
+                    document.body.appendChild(div);
+                }""")
+                
+                try:
+                    page.wait_for_function("window.__manual_login_done === true", timeout=300000)
+                    logger.info(f"   ✅ 用户确认登录，开始遍历")
+                except Exception:
+                    logger.warning(f"   ⚠️ 等待超时，直接开始")
+                
+                # 移除按钮
+                try:
+                    page.evaluate("""() => {
+                        const el = document.getElementById('__manual_login_done__');
+                        if (el) el.remove();
+                        delete window.__manual_login_done;
+                    }""")
+                except Exception:
+                    pass
+                
+                page.wait_for_timeout(2000)
+            
+            # 保存当前Session
+            try:
+                context.storage_state(path=session_file)
+                logger.info(f"   💾 Session已保存")
+            except Exception as e:
+                logger.info(f"   ⚠️ 保存Session失败: {e}")
+            
+            # 首先获取所有页面列表
+            logger.info(f"   📋 获取所有页面列表...")
+            all_page_names = []
+            
+            # 获取墨刀页面列表：提取页面名+screen ID，用URL导航切换页面
+            try:
+                all_page_names_result = page.evaluate("""() => {
+                    const debugInfo = [];
+                    const pages = [];
+                    
+                    // ===== 找到墨刀页面列表UL =====
+                    const allULs = document.querySelectorAll('ul');
+                    let pageListUL = null;
+                    
+                    for (const ul of allULs) {
+                        const cls = (ul.className || '').toString();
+                        const rect = ul.getBoundingClientRect();
+                        if (cls.includes('StyledScreenList') && rect.left < 100) {
+                            pageListUL = ul;
+                            debugInfo.push('找到页面列表UL: class=' + cls + ' left=' + rect.left);
+                            break;
+                        }
+                    }
+                    
+                    if (!pageListUL) {
+                        for (const ul of allULs) {
+                            const rect = ul.getBoundingClientRect();
+                            const text = (ul.textContent || '').trim();
+                            if (rect.left < 100 && (text.includes('需求说明') || text.includes('需求'))) {
+                                pageListUL = ul;
+                                debugInfo.push('回退找到页面列表UL: left=' + rect.left);
+                                break;
+                            }
+                        }
+                    }
+                    
+                    if (!pageListUL) {
+                        debugInfo.push('未找到页面列表UL');
+                        return { debugInfo: debugInfo, pages: [] };
+                    }
+                    
+                    // ===== 遍历所有LI，提取页面名和screen ID =====
+                    const allLIs = pageListUL.querySelectorAll('li');
+                    debugInfo.push('总LI数量: ' + allLIs.length);
+                    
+                    for (const li of allLIs) {
+                        const fullText = (li.textContent || '').trim();
+                        
+                        // 跳过注释/标注
+                        if (/^\\d+[.\\)、]/.test(fullText) && fullText.length > 20) continue;
+                        if (fullText.includes('场景：') || fullText.includes('规则：')) continue;
+                        
+                        // 提取screen ID：从LI的data属性、onclick、或子元素链接中获取
+                        let screenId = '';
+                        
+                        // 方法1: data-screen属性
+                        if (li.dataset && li.dataset.screen) {
+                            screenId = li.dataset.screen;
+                        }
+                        // 方法2: data-id属性
+                        if (!screenId && li.dataset && li.dataset.id) {
+                            screenId = li.dataset.id;
+                        }
+                        // 方法3: 子元素a的href
+                        if (!screenId) {
+                            const link = li.querySelector('a[href]');
+                            if (link) {
+                                const href = link.getAttribute('href') || '';
+                                const match = href.match(/screen=([^&]+)/);
+                                if (match) screenId = match[1];
+                            }
+                        }
+                        // 方法4: 子元素的data属性
+                        if (!screenId) {
+                            const children = li.querySelectorAll('[data-screen], [data-id], [data-key]');
+                            for (const child of children) {
+                                if (child.dataset && (child.dataset.screen || child.dataset.id || child.dataset.key)) {
+                                    screenId = child.dataset.screen || child.dataset.id || child.dataset.key;
+                                    break;
+                                }
+                            }
+                        }
+                        // 方法5: 从LI的所有属性中找
+                        if (!screenId) {
+                            for (const attr of li.attributes) {
+                                const val = attr.value || '';
+                                if (val.length >= 8 && val.length <= 30 && /^[a-zA-Z0-9]+$/.test(val)) {
+                                    screenId = val;
+                                    break;
+                                }
+                            }
+                        }
+                        // 方法6: 从子元素属性中找
+                        if (!screenId) {
+                            const allChildren = li.querySelectorAll('*');
+                            for (const child of allChildren) {
+                                for (const attr of child.attributes) {
+                                    const val = attr.value || '';
+                                    if (val.length >= 8 && val.length <= 30 && /^[a-zA-Z0-9]+$/.test(val)) {
+                                        screenId = val;
+                                        break;
+                                    }
+                                }
+                                if (screenId) break;
+                            }
+                        }
+                        
+                        // 提取页面名：取LI中第一个直接文本或第一个span/div的短文本
+                        let pageName = '';
+                        // 优先取短文本
+                        const shortTexts = [];
+                        const walker = document.createTreeWalker(li, NodeFilter.SHOW_TEXT, null, false);
+                        let node;
+                        while (node = walker.nextNode()) {
+                            const t = (node.textContent || '').trim();
+                            if (t && t.length >= 2 && t.length <= 20) {
+                                shortTexts.push(t);
+                            }
+                        }
+                        
+                        if (shortTexts.length > 0) {
+                            // 第一个短文本通常是页面名
+                            pageName = shortTexts[0];
+                        } else if (fullText.length <= 25) {
+                            pageName = fullText;
+                        }
+                        
+                        if (pageName && pageName.length >= 2) {
+                            debugInfo.push('页面: name=' + pageName + ' screenId=' + screenId + ' fullText=' + fullText.substring(0, 40));
+                            pages.push({ name: pageName, screenId: screenId, fullText: fullText });
+                        }
+                    }
+                    
+                    debugInfo.push('总页面数: ' + pages.length);
+                    console.log('[调试] 页面列表:', debugInfo);
+                    
+                    return {
+                        debugInfo: debugInfo,
+                        pages: pages
+                    };
+                }""")
+                
+                logger.info(f"   🔍 页面列表调试信息: {all_page_names_result.get('debugInfo', [])}")
+                
+                raw_pages = all_page_names_result.get('pages', [])
+                logger.info(f"   ✅ 找到 {len(raw_pages)} 个页面")
+                
+                # 去重：同名页面只保留第一个
+                seen_names = set()
+                all_page_names = []
+                page_screen_map = {}
+                for p in raw_pages:
+                    name = p.get('name', '')
+                    screen_id = p.get('screenId', '')
+                    if name and name not in seen_names:
+                        seen_names.add(name)
+                        all_page_names.append(name)
+                        if screen_id:
+                            page_screen_map[name] = screen_id
+                
+                logger.info(f"   📝 去重后页面: {all_page_names}")
+                logger.info(f"   📝 页面-screenId映射: {page_screen_map}")
+                
+            except Exception as e:
+                logger.info(f"   ⚡ 获取页面列表失败: {e}")
+                all_page_names = ["主页面"]
+                page_screen_map = {}
+            
+            # 获取当前URL的基础部分（用于URL导航）
+            base_url = page.evaluate("() => window.location.href")
+            logger.info(f"   📝 当前URL: {base_url}")
+            
+            # 遍历每个页面
+            for idx, page_name in enumerate(all_page_names):
+                logger.info(f"   👉 [{idx+1}/{len(all_page_names)}] 处理页面: {page_name}")
+                
+                # 使用URL导航切换页面（比点击更可靠）
+                navigated = False
+                try:
+                    screen_id = page_screen_map.get(page_name, '')
+                    
+                    if screen_id:
+                        # 有screen ID，直接URL导航
+                        if 'screen=' in base_url:
+                            new_url = re.sub(r'screen=[^&]+', f'screen={screen_id}', base_url)
+                        else:
+                            new_url = base_url + f'&screen={screen_id}'
+                        
+                        # 确保是read_only模式，不是inspect
+                        new_url = new_url.replace('view_mode=inspect', 'view_mode=read_only')
+                        
+                        logger.info(f"   🔗 URL导航: {new_url}")
+                        page.goto(new_url, wait_until='domcontentloaded', timeout=15000)
+                        page.wait_for_timeout(2000)
+                        navigated = True
+                    else:
+                        # 没有screen ID，回退到点击方式，但只在页面列表UL中精确点击
+                        navigated = page.evaluate("""(pageName) => {
+                            const allULs = document.querySelectorAll('ul');
+                            let pageListUL = null;
+                            
+                            for (const ul of allULs) {
+                                const cls = (ul.className || '').toString();
+                                const rect = ul.getBoundingClientRect();
+                                if (cls.includes('StyledScreenList') && rect.left < 100) {
+                                    pageListUL = ul;
+                                    break;
+                                }
+                            }
+                            if (!pageListUL) return false;
+                            
+                            // 先在子UL(child-screens)中找精确匹配
+                            const childULs = pageListUL.querySelectorAll('ul');
+                            for (const childUL of childULs) {
+                                const childLIs = childUL.querySelectorAll(':scope > li');
+                                for (const li of childLIs) {
+                                    const t = (li.textContent || '').trim();
+                                    if (t === pageName) {
+                                        li.click();
+                                        li.dispatchEvent(new MouseEvent('click', {bubbles: true, composed: true}));
+                                        return true;
+                                    }
+                                }
+                            }
+                            
+                            // 再在顶层LI中找精确匹配
+                            const topLIs = pageListUL.querySelectorAll(':scope > li');
+                            for (const li of topLIs) {
+                                const t = (li.textContent || '').trim();
+                                if (t === pageName) {
+                                    li.click();
+                                    li.dispatchEvent(new MouseEvent('click', {bubbles: true, composed: true}));
+                                    return true;
+                                }
+                            }
+                            
+                            return false;
+                        }""", page_name)
+                        
+                        if navigated:
+                            page.wait_for_timeout(2000)
+                    
+                    if navigated:
+                        # 提取当前页面内容
+                        content = _extract_page_content(page)
+                        
+                        # 尝试点击「标注」标签页，提取标注内容
+                        page.evaluate("""() => {
+                            const labels = ['标注', '备注', '说明', '文档', '需求'];
+                            const allEl = document.querySelectorAll('*');
+                            for (const el of allEl) {
+                                const t = (el.textContent || '').trim();
+                                if (labels.includes(t) && (el.tagName === 'DIV' || el.tagName === 'SPAN' || el.tagName === 'BUTTON')) {
+                                    const style = window.getComputedStyle(el);
+                                    if (style.cursor === 'pointer' || el.tagName === 'BUTTON') {
+                                        el.click();
+                                        break;
+                                    }
+                                }
+                            }
+                        }""")
+                        
+                        page.wait_for_timeout(1500)
+                        
+                        # 提取标注/说明区域的文本
+                        note_text = page.evaluate("""() => {
+                            const texts = [];
+                            const selectors = [
+                                '[class*="note"]', '[class*="annotation"]', '[class*="remark"]', '[class*="doc"]',
+                                '[class*="annotation"]', '[class*="sticky"]', '[class*="comment"]',
+                                'div[style*="background-color:"]', 'div[style*="background:"]',
+                                'div[style*="border:"]', 'div[style*="padding:"]'
+                            ];
+                            selectors.forEach(sel => {
+                                try {
+                                    const els = document.querySelectorAll(sel);
+                                    els.forEach(el => {
+                                        const t = (el.textContent || '').trim();
+                                        if (t && t.length > 10) {
+                                            texts.push(t);
+                                        }
+                                    });
+                                } catch(e){}
+                            });
+                            return [...new Set(texts)].slice(0, 50);
+                        }""")
+                        
+                        if note_text:
+                            logger.info(f"   📝 提取到标注内容: {len(note_text)} 条")
+                            logger.info(f"   📝 标注内容预览: {str(note_text)[:200]}")
+                            content += "\n## 标注/说明文档\n" + "\n".join([f"- {t}" for t in note_text])
+                        else:
+                            logger.info(f"   ⚠️ 未提取到标注内容")
+                        
+                        # 额外提取SVG文本
+                        svg_texts = page.evaluate("""() => {
+                            const texts = [];
+                            const elements = document.querySelectorAll('svg text, svg tspan');
+                            elements.forEach(el => {
+                                const t = (el.textContent || '').trim();
+                                if (t && t.length > 1) texts.push(t);
+                            });
+                            return [...new Set(texts)].slice(0, 100);
+                        }""")
+                        
+                        if svg_texts:
+                            content += "\n## SVG文本\n" + "\n".join([f"- {t}" for t in svg_texts])
+                        
+                        pages_collected.append({
+                            "name": page_name,
+                            "content": content
+                        })
+                        logger.info(f"      ✅ 提取完成: {len(content)} 字符")
+                    
+                except Exception as e:
+                    logger.info(f"      ⚡ 点击页面失败: {e}")
+            
+            # 如果没有收集到任何页面，就提取当前页面
+            if not pages_collected:
+                logger.info(f"   📋 未找到可点击页面，提取当前页面")
+                content = _extract_page_content(page)
+                
+                # 尝试点击「标注」标签页，提取标注内容
+                page.evaluate("""() => {
+                    const labels = ['标注', '备注', '说明', '文档', '需求'];
+                    const allEl = document.querySelectorAll('*');
+                    for (const el of allEl) {
+                        const t = (el.textContent || '').trim();
+                        if (labels.includes(t) && (el.tagName === 'DIV' || el.tagName === 'SPAN' || el.tagName === 'BUTTON')) {
+                            const style = window.getComputedStyle(el);
+                            if (style.cursor === 'pointer' || el.tagName === 'BUTTON') {
+                                el.click();
+                                break;
+                            }
+                        }
+                    }
+                }""")
+                
+                page.wait_for_timeout(1500)
+                
+                # 提取标注/说明区域的文本
+                note_text = page.evaluate("""() => {
+                    const texts = [];
+                    const selectors = [
+                        '[class*="note"]', '[class*="annotation"]', '[class*="remark"]', '[class*="doc"]',
+                        '[class*="annotation"]', '[class*="sticky"]', '[class*="comment"]',
+                        'div[style*="background-color:"]', 'div[style*="background:"]',  
+                        'div[style*="border:"]', 'div[style*="padding:"]'
+                    ];
+                    selectors.forEach(sel => {
+                        try {
+                            const els = document.querySelectorAll(sel);
+                            els.forEach(el => {
+                                const t = (el.textContent || '').trim();
+                                if (t && t.length > 10) {
+                                    texts.push(t);
+                                }
+                            });
+                        } catch(e){}
+                    });
+                    return [...new Set(texts)].slice(0, 50);
+                }""")
+                
+                if note_text:
+                    logger.info(f"   📝 提取到标注内容: {len(note_text)} 条")
+                    logger.info(f"   📝 标注内容预览: {str(note_text)[:200]}")
+                    content += "\n## 标注/说明文档\n" + "\n".join([f"- {t}" for t in note_text])
+                else:
+                    logger.info(f"   ⚠️ 未提取到标注内容")
+                
+                svg_texts = page.evaluate("""() => {
+                    const texts = [];
+                    const elements = document.querySelectorAll('svg text, svg tspan');
+                    elements.forEach(el => {
+                        const t = (el.textContent || '').trim();
+                        if (t && t.length > 1) texts.push(t);
+                    });
+                    return [...new Set(texts)].slice(0, 100);
+                }""")
+                if svg_texts:
+                    content += "\n## SVG文本\n" + "\n".join([f"- {t}" for t in svg_texts])
+                
+                pages_collected.append({
+                    "name": "主页面",
+                    "content": content
+                })
+            
+            page_title = page.title()
+            browser.close()
+            
+            # 合并所有页面内容（去重）
+            seen_content = set()
+            unique_pages = []
+            for p in pages_collected:
+                content_hash = hashlib.md5(p['content'].encode()).hexdigest()
+                if content_hash not in seen_content:
+                    seen_content.add(content_hash)
+                    unique_pages.append(p)
+            
+            if len(unique_pages) < len(pages_collected):
+                logger.info(f"   🔄 去重：{len(pages_collected)} -> {len(unique_pages)} 个页面")
+            
+            all_content_lines = []
+            all_content_lines.append(f"墨刀原型名称: {page_title}")
+            all_content_lines.append(f"原型URL: {url}")
+            all_content_lines.append("")
+            
+            for p in unique_pages:
+                all_content_lines.append(f"=== 页面: {p['name']} ===")
+                all_content_lines.append(p['content'])
+                all_content_lines.append("")
+            
+            all_content = "\n".join(all_content_lines)
+            
+            logger.info(f"✅ 遍历完成，收集到 {len(unique_pages)} 个有效页面，总内容 {len(all_content)} 字符")
+            
+            return {
+                "success": True,
+                "pages": unique_pages,
+                "all_content": all_content
+            }
+            
+    except Exception as e:
+        logger.error(f"❌ 遍历墨刀页面异常: {e}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "success": False,
+            "error": str(e),
+            "pages": pages_collected,
+            "all_content": ""
+        }
+
+
+# 需求分析评审提示词
+REQUIREMENT_ANALYSIS_PROMPT = """你是一名资深测试工程师，需要对产品原型/需求文档进行专业的测试需求分析。
+
+【核心任务】
+站在测试工程师的角度，分析以下内容，梳理出可测试的功能点、测试场景和风险点。
+
+⚠️ 特别重要：如果提供的内容里包含「## 标注/说明文档」或类似的需求说明章节，请**优先且重点分析标注内容**！标注里通常包含了具体的业务规则、校验逻辑、计算规则、命名规则、权限规则等细节，这些是测试用例的核心依据！
+
+1. **产品功能概述**：一句话概括产品核心功能
+2. **核心功能点**：列出所有可测试的功能点（每个功能点应具体、可验证）
+3. **业务流程**：梳理主要业务流程，标注关键节点和分支
+4. **功能模块划分**：按模块划分功能，每个模块列出具体的测试关注点
+5. **测试场景设计**：针对每个功能点，设计正向和异常测试场景
+6. **风险识别**：识别潜在的质量风险、边界条件和容易出bug的地方
+7. **测试建议**：给出具体的测试策略和优先级建议
+
+【输出格式】
+返回JSON格式，结构如下：
+{
+    "product_name": "产品名称",
+    "product_summary": "一句话产品功能概述",
+    "core_features": [
+        {"feature": "功能名称", "description": "功能描述", "test_focus": "测试关注点"}
+    ],
+    "business_processes": [
+        {"process": "流程名称", "steps": ["步骤1", "步骤2"], "branch_points": ["分支点1"]}
+    ],
+    "modules": [
+        {
+            "name": "模块名",
+            "description": "模块描述",
+            "features": ["功能点1", "功能点2"],
+            "test_scenarios": ["测试场景1", "测试场景2"]
+        }
+    ],
+    "test_strategy": {
+        "smoke_tests": ["冒烟测试点1"],
+        "functional_tests": ["功能测试点1"],
+        "edge_cases": ["边界条件1"],
+        "exception_tests": ["异常场景1"]
+    },
+    "risks": ["风险点1", "风险点2"],
+    "test_priority_suggestions": ["建议1", "建议2"]
+}
+
+【测试工程师分析原则】
+- 从用户实际操作角度出发，关注真实使用场景
+- 每个功能点必须可测试、可验证
+- 不仅要关注正向流程，还要关注异常路径和边界条件
+- 关注UI交互细节：按钮状态、输入校验、提示信息、页面跳转等
+- 关注数据流转：输入→处理→输出，每个环节都要验证
+- 关注权限和角色：不同角色的操作权限差异
+- 关注兼容性：不同设备、不同数据量下的表现
+- 关注性能：大数据量、高并发等场景
+
+【注意】
+- 输出纯JSON，不要markdown代码块
+- 从实际页面内容中提取信息，不要编造功能
+- 分析要具体、可落地，不要空泛的套话
+- 如果页面内容较少，根据已有信息合理推断，但要标注"推测"
+"""
+
+@retry_api_call
+def analyze_requirement(document_content: str) -> Dict:
+    """AI需求分析评审
+    
+    Returns:
+        符合REQUIREMENT_ANALYSIS_PROMPT格式的Dict
+    """
+    logger.info(f"📊 开始需求分析: 文档长度={len(document_content)}")
+    try:
+        # 如果文档过长，截取前50000字符（保留尽可能多的内容）
+        content_to_analyze = document_content[:50000] if len(document_content) > 50000 else document_content
+        if len(document_content) > 50000:
+            logger.info(f"📊 文档过长({len(document_content)}字符)，截取前50000字符分析")
+        
+        ai_text = _cached_ai_chat(
+            messages=[
+                {"role": "system", "content": REQUIREMENT_ANALYSIS_PROMPT},
+                {"role": "user", "content": content_to_analyze}
+            ],
+            model=AI_MODEL,
+            max_tokens=16000,
+            temperature=0.2,
+            timeout=AI_REQUEST_TIMEOUT
+        )
+        
+        # 解析JSON
+        result = extract_json_from_response(ai_text)
+        
+        logger.info(f"✅ 需求分析完成: {len(str(result))} 字符")
+        return result
+    except Exception as e:
+        logger.error(f"❌ 需求分析失败: {e}")
+        raise
+
+
+def _extract_page_content(page) -> str:
+    """从页面提取可见文本内容和交互元素描述"""
+    result = page.evaluate("""() => {
                 const extractText = (el, depth = 0) => {
                     if (depth > 3) return [];
                     const texts = [];
                     const tag = el.tagName ? el.tagName.toLowerCase() : '';
 
-                    if (tag === 'script' || tag === 'style' || tag === 'noscript' || tag === 'svg') return [];
+                    if (tag === 'script' || tag === 'style' || tag === 'noscript') return [];
+                    // 跳过注入的UI元素
+                    if (el.id === '__manual_login_done__') return [];
 
                     const style = window.getComputedStyle(el);
                     if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return [];
@@ -1578,281 +3202,462 @@ def fetch_url_content(url: str, login_url: str = "", login_username: str = "",
                 };
             }""")
 
-            lines = []
-            lines.append(f"页面标题: {result.get('title', '')}")
-            lines.append(f"页面URL: {result.get('url', '')}")
-            lines.append("")
+    lines = []
+    lines.append(f"页面标题: {result.get('title', '')}")
+    lines.append(f"页面URL: {result.get('url', '')}")
+    lines.append("")
 
-            if result.get('menus'):
-                lines.append("## 导航菜单")
-                for m in result['menus']:
-                    lines.append(f"- {m}")
+    if result.get('menus'):
+        lines.append("## 导航菜单")
+        for m in result['menus']:
+            lines.append(f"- {m}")
 
-            if result.get('buttons'):
-                lines.append("\n## 按钮")
-                for b in result['buttons']:
-                    lines.append(f"- {b}")
+    if result.get('buttons'):
+        lines.append("\n## 按钮")
+        for b in result['buttons']:
+            lines.append(f"- {b}")
 
-            if result.get('inputs'):
-                lines.append("\n## 输入框/表单字段")
-                for i in result['inputs']:
-                    lines.append(f"- {i}")
+    if result.get('inputs'):
+        lines.append("\n## 输入框/表单字段")
+        for i in result['inputs']:
+            lines.append(f"- {i}")
 
-            if result.get('links'):
-                lines.append("\n## 链接")
-                for l in result['links']:
-                    lines.append(f"- {l}")
+    if result.get('links'):
+        lines.append("\n## 链接")
+        for l in result['links']:
+            lines.append(f"- {l}")
 
-            lines.append("\n## 页面可见文本")
-            for t in result.get('visibleTexts', []):
-                lines.append(f"- {t}")
+    lines.append("\n## 页面可见文本")
+    for t in result.get('visibleTexts', []):
+        lines.append(f"- {t}")
 
-            output = '\n'.join(lines)
-            logger.info(f"   ✅ 提取到 {len(output)} 字符")
-            logger.info(f"   📝 内容预览: {output[:300]}...")
-            if len(output) < 500:
-                logger.warning(f"   ⚠️ 提取内容过少（{len(output)}字符），可能页面需要登录或为空")
-            return output
-
-        finally:
-            browser.close()
+    output = '\n'.join(lines)
+    logger.info(f"   ✅ 提取到 {len(output)} 字符")
+    logger.info(f"   📝 内容预览: {output[:300]}...")
+    if len(output) < 500:
+        logger.warning(f"   ⚠️ 提取内容过少（{len(output)}字符），可能页面需要登录或为空")
+    return output
 
 
 DOCUMENT_PARSE_PROMPT = """
-你是一名资深测试专家，需要根据用户提供的需求文档（PRD、用户故事或接口文档），生成**全面、高覆盖率**的自动化测试用例集。
+你是一名资深测试专家。用户会提供一份从网页原型（如墨刀）中提取的混合内容，其中包含：
+1. **需求描述**（核心）：原型旁的标注/说明文字、业务规则、校验逻辑、计算规则、权限规则、需求背景等
+2. **UI文本**（噪音）：导航菜单名称、表单字段标签、按钮文字、表格列名等页面元素名称
 
-【覆盖要求 —— 必须严格遵守】
-1. 每个功能点至少生成：1 条正向用例 + 至少 3 条异常/边界用例
-2. 必须覆盖以下所有测试场景类型：
-   - ✅ 正常流程（Happy Path）
-   - ✅ 异常操作：重复提交、并发冲突、非法操作、权限不足
-   - ✅ 边界条件：最大值、最小值、空值、超长文本、临界值
-   - ✅ 权限校验：无权限访问、越权操作、未登录访问
-3. 优先覆盖：高频操作 > 核心链路 > 高危边界
+【第一步：充分挖掘需求点】
+请仔细阅读全文，提取每一个需求点。需求点包括但不限于：
+- 标注/说明文档中的业务规则（如"规则：1.xxx 2.xxx"）
+- 校验逻辑（如"不超过200字"、"最多可选10个"）
+- 计算规则（如"自动计算定金总额"、"按比例计算"）
+- 权限规则（如"默认关闭，需授权开启"、"若授权关闭则无法登录"）
+- 需求背景和功能描述（如"新增xxx功能"、"优化xxx"）
+- 数据流转规则（如"关联订单选择"、"生成带章合同"）
+⚠️ 请从标注/说明文档中挖掘每一个"规则："，每条规则都是一个独立的需求点！
+
+【过滤UI噪音】
+只忽略以下纯UI文本，不要从它们推断需求：
+- 导航菜单名称（如"商机中心、销售中心..."）
+- 表单字段标签（如"订单编号、客户名称..."）
+- 按钮文字（如"提交、取消..."）
+- 表格列名（如"订单状态、支付状态..."）
+
+【第二步：生成测试用例 —— 数量要求】
+- 文档约5万字符，包含8个页面的标注内容，请充分挖掘
+- 每个需求点至少生成2条用例（1条正向 + 1条异常/边界）
+- 每个模块至少生成4条用例
+- 目标总数量：30~60条（请根据实际需求点数量合理生成）
+- 覆盖正向流程、异常操作、边界条件、逆向流程四种场景类型
 
 【用例字段规范】
-每个测试用例必须包含以下字段：
-- id：用例编号，格式 TC-{模块缩写}-{3位序号}，如 TC-ORDER-001
-  模块缩写从文档中推断：订单→ORDER、登录→LOGIN、客户→CUST、商品→PROD、支付→PAY
-- name：用例名称，清晰描述测试场景（如"正向-创建销售订单"）
+- id：用例编号，格式 TC-{模块缩写}-{三位序号}，如 TC-AUTH-001
+- name：用例名称，清晰描述测试场景
+- module：所属功能模块名称
+- priority：P0（核心）/ P1（重要）/ P2（一般）/ P3（边缘）
 - preconditions：前置条件
-- steps：符合Playwright格式的步骤数组（action/selector/value/description）
+- test_steps：测试步骤，字符串数组
 - expected_result：预期结果
-- scenario_type：正向流程 / 异常操作 / 边界条件 / 权限校验
-
-【根据文档类型调整策略】
-- PRD/需求文档：提取所有功能点、业务流程、异常路径
-- 用户故事：按 Given-When-Then 分解，覆盖 Happy Path + 异常
-- 接口文档/Swagger：覆盖正常请求、参数校验、认证鉴权、错误码
+- test_data：测试数据（如无则写"无"）
+- scenario_type：正向流程 / 异常操作 / 边界条件 / 逆向流程
 
 【输出要求】
-返回纯JSON数组，不要任何额外解释、不要markdown、不要代码块。
+- 返回纯JSON数组，不要markdown、不要代码块、不要额外解释
+- 确保JSON格式完整有效，所有字符串用双引号
+- 请认真分析、充分生成，每条用例都要有独立的价值
 """
 
 
 @retry_api_call
 def ai_generate_cases_from_document(document_text: str, doc_type: str = "prd", url: str = "") -> List[Dict]:
     logger.info(f"📄 从文档生成用例: {doc_type}, 文档长度={len(document_text)}...")
+    
+    # 截取文档：单次调用，最多取60000字符
+    MAX_INPUT = 60000
+    content = document_text[:MAX_INPUT] if len(document_text) > MAX_INPUT else document_text
+    if len(document_text) > MAX_INPUT:
+        logger.info(f"📄 文档过长({len(document_text)}字符)，截取前{MAX_INPUT}字符")
+    
     try:
-        response = client.chat.completions.create(
-            model=AI_MODEL,
+        ai_text = _cached_ai_chat(
             messages=[
                 {"role": "system", "content": DOCUMENT_PARSE_PROMPT},
                 {
                     "role": "user",
                     "content": (
-                        f"文档类型：{doc_type}（prd=需求文档, user_story=用户故事, api_doc=接口文档）\n"
+                        f"文档类型：{doc_type}（prd=需求文档, user_story=用户故事, api_doc=接口文档, web_prototype=网页原型）\n"
                         f"目标URL（如有）：{url}\n"
-                        f"文档内容：\n{document_text[:15000]}"
+                        f"以下是从网页原型中提取的混合内容（包含需求描述和UI文本），请先过滤噪音再生成用例：\n\n{content}"
                     )
                 }
             ],
-            max_tokens=8000,
+            model=AI_MODEL,
+            max_tokens=16000,
             temperature=0.1,
             timeout=AI_REQUEST_TIMEOUT
         )
-        ai_text = response.choices[0].message.content.strip()
+        logger.info(f"📄 AI返回内容长度: {len(ai_text)} 字符")
+        
         test_cases = extract_json_from_response(ai_text)
         if isinstance(test_cases, dict):
             test_cases = test_cases.get("test_cases", [])
+        
         valid_cases = []
         for case in test_cases:
             if not case.get("name"):
                 continue
-            steps = case.get("steps", [])
-            valid_steps = []
-            for step in steps:
-                if not step.get("action") or not step.get("selector"):
-                    continue
-                if step.get("action") not in ("fill", "click", "wait_for_selector", "assert_text"):
-                    continue
-                if step.get("action") in ("fill", "assert_text") and not step.get("value"):
-                    continue
-                valid_steps.append(step)
-            case["steps"] = valid_steps if valid_steps else steps
+            test_steps = case.get("test_steps", case.get("steps", []))
+            if isinstance(test_steps, str):
+                try:
+                    test_steps = json.loads(test_steps)
+                except (json.JSONDecodeError, TypeError):
+                    test_steps = [test_steps]
+            if not test_steps:
+                continue
+            case["steps"] = test_steps
             case["url"] = url
-            case["test_type"] = "web" if url else "api"
+            case["test_type"] = "web"
+            if "test_steps" not in case:
+                case["test_steps"] = test_steps
+            if "module" not in case:
+                case["module"] = ""
+            if "priority" not in case:
+                case["priority"] = "P1"
+            if "test_data" not in case:
+                case["test_data"] = ""
             valid_cases.append(case)
-        logger.info(f"✅ 从文档生成{len(valid_cases)}个用例")
+        
+        logger.info(f"✅ 从文档生成 {len(valid_cases)} 个功能测试用例")
         return valid_cases
     except Exception as e:
         logger.error(f"❌ 文档解析生成失败: {e}", exc_info=True)
         raise
 
 
+# ======================== 功能用例转自动化步骤（AI转换） ========================
+
+FUNC_TO_AUTO_PROMPT = """
+你是一名自动化测试专家。请将用户提供的功能测试用例转换为Playwright自动化测试步骤JSON。
+
+【转换规则】
+1. 分析功能用例的测试步骤、前置条件、预期结果，推断出每个步骤对应的自动化操作
+2. 每个步骤必须包含：
+   - action: click（点击）/ fill（输入）/ wait_for_selector（等待元素出现）/ assert_text（验证文本）
+   - selector: 基于元素描述推断的CSS选择器（如按钮→button包含文本，输入框→input/textarea的placeholder）
+   - value: fill时填写的值 / assert_text时验证的文本
+   - description: 中文操作描述
+3. 必须包含验证步骤（assert_text）：根据预期结果，验证关键数据或状态是否正确显示
+4. 选择器生成规则：
+   - 按钮：button:has-text('按钮文字'), [role='button']:has-text('按钮文字')
+   - 输入框：input[placeholder*='占位文字'], [class*='input'] input
+   - 表格行：tr:has-text('关键文本'), .ant-table-row:has-text('关键文本')
+   - 弹窗：div[role='dialog'] 下的元素
+   - 下拉选择：.ant-select, [class*='select']
+5. 如果功能用例提到了具体的字段名（如"订单编号"、"客户名称"），用这些字段名生成选择器
+6. 如果功能用例提到了具体的值（如"200字"、"10个"），用它作为fill或assert的value
+
+【输出格式】
+返回纯JSON数组，不要markdown、不要代码块、不要额外解释：
+[
+  {
+    "action": "click",
+    "selector": "button:has-text('新建订单')",
+    "value": "",
+    "description": "点击新建订单按钮"
+  },
+  {
+    "action": "fill",
+    "selector": "input[placeholder*='订单编号']",
+    "value": "TEST-001",
+    "description": "输入订单编号"
+  },
+  {
+    "action": "assert_text",
+    "selector": ".ant-table td:has-text('TEST-001')",
+    "value": "TEST-001",
+    "description": "验证订单创建成功"
+  }
+]
+"""
+
+@retry_api_call
+def ai_convert_func_to_auto_steps(func_case_info: dict) -> List[Dict]:
+    """将功能用例转换为自动化测试步骤
+    
+    Args:
+        func_case_info: {name, module, steps, preconditions, expected_result, test_data, scenario_type}
+    Returns:
+        List[Dict]: 自动化测试步骤JSON数组
+    """
+    steps_text = func_case_info.get("steps", "")
+    if isinstance(steps_text, list):
+        steps_text = "\n".join(steps_text)
+    
+    preconditions = func_case_info.get("preconditions", "")
+    expected = func_case_info.get("expected_result", "")
+    test_data = func_case_info.get("test_data", "")
+    module = func_case_info.get("module", "")
+    name = func_case_info.get("name", "")
+    
+    user_content = f"""请将以下功能测试用例转换为自动化测试步骤：
+
+用例名称：{name}
+所属模块：{module}
+前置条件：{preconditions}
+测试步骤：
+{steps_text}
+预期结果：{expected}
+测试数据：{test_data}
+
+请生成包含click/fill/wait/assert的自动化步骤JSON，确保包含验证步骤。"""
+    
+    try:
+        ai_text = _cached_ai_chat(
+            messages=[
+                {"role": "system", "content": FUNC_TO_AUTO_PROMPT},
+                {"role": "user", "content": user_content}
+            ],
+            model=AI_MODEL,
+            max_tokens=2000,
+            temperature=0.1,
+            timeout=AI_REQUEST_TIMEOUT
+        )
+        steps = extract_json_from_response(ai_text)
+        if isinstance(steps, dict):
+            steps = steps.get("steps", [])
+        
+        valid_steps = []
+        for s in steps:
+            if not isinstance(s, dict):
+                continue
+            action = s.get("action")
+            selector = s.get("selector")
+            if not action or not selector:
+                continue
+            if action not in ("fill", "click", "wait_for_selector", "assert_text"):
+                continue
+            valid_steps.append({
+                "action": action,
+                "selector": selector,
+                "value": s.get("value", ""),
+                "description": s.get("description", "")
+            })
+        
+        return valid_steps
+    except Exception as e:
+        logger.error(f"❌ AI转换功能用例失败: {e}")
+        return []
+
+
 # ======================== 探索性生成（页面遍历识别交互元素） ========================
+
+# 【新增】浏览器资源清理辅助函数（池模式和独立模式统一入口）
+def _browser_cleanup(p, browser, page):
+    """【新增】浏览器资源清理：池模式调用release，独立模式关闭浏览器和playwright"""
+    if USE_BROWSER_POOL:
+        from optimizations import browser_pool
+        browser_pool.release(page)
+    else:
+        try:
+            browser.close()
+        except Exception:
+            pass
+        try:
+            if p is not None:
+                p.stop()
+        except Exception:
+            pass
+
+
+def launch_browser_with_retry(playwright_instance, headless=True, max_retries=3, retry_delay=1.0):
+    """【新增】浏览器启动失败重试机制，Playwright偶尔启动失败时自动重试"""
+    for attempt in range(max_retries):
+        try:
+            browser = playwright_instance.chromium.launch(headless=headless)
+            logger.debug(f"✅ 浏览器启动成功 (尝试 {attempt+1}/{max_retries})")
+            return browser
+        except Exception as e:
+            if attempt < max_retries - 1:
+                logger.warning(f"⚠️ 浏览器启动失败 (尝试 {attempt+1}/{max_retries}): {e}，{retry_delay}秒后重试...")
+                time.sleep(retry_delay)
+            else:
+                raise BrowserError(f"浏览器启动失败，已达最大重试次数 {max_retries}: {e}") from e
+
 
 def crawl_page_interactive_elements(url: str, login_url: str = "", username: str = "",
                                      password: str = "", username_selector: str = "",
                                      password_selector: str = "", submit_selector: str = "") -> Dict:
     """遍历页面，提取所有可交互元素和页面结构。支持先登录再爬取。"""
     logger.info(f"🕷️ 探索性爬取页面: {url}")
-    with sync_playwright() as p:
+    # 【新增】浏览器池模式：复用浏览器实例，避免频繁启动关闭
+    if USE_BROWSER_POOL:
+        from optimizations import browser_pool
+        p, browser, context, page = browser_pool.acquire(headless=True)
+    else:
+        p = sync_playwright().start()
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(viewport=VIEWPORT)
         page = context.new_page()
-        try:
-            same_page_login = False
-            if login_url and username and password:
-                login_parsed = urlparse(login_url)
-                target_parsed = urlparse(url)
-                same_page_login = (login_parsed.netloc == target_parsed.netloc and
-                            login_parsed.path.rstrip('/') == target_parsed.path.rstrip('/'))
+    try:
+        same_page_login = False
+        if login_url and username and password:
+            login_parsed = urlparse(login_url)
+            target_parsed = urlparse(url)
+            same_page_login = (login_parsed.netloc == target_parsed.netloc and
+                        login_parsed.path.rstrip('/') == target_parsed.path.rstrip('/'))
 
-                if same_page_login:
-                    logger.info(f"   🔐 登录URL与目标URL相同，在同一页面执行登录")
-                    page.goto(url, timeout=PAGE_LOAD_TIMEOUT)
-                    try:
-                        page.wait_for_load_state("networkidle", timeout=15000)
-                    except Exception:
-                        try:
-                            page.wait_for_load_state("domcontentloaded", timeout=10000)
-                        except Exception:
-                            pass
-                    page.wait_for_timeout(2000)
-                    _perform_login(page, username, password, username_selector,
-                                  password_selector, submit_selector)
-                    page.wait_for_timeout(3000)
-                    try:
-                        page.wait_for_load_state("networkidle", timeout=10000)
-                    except Exception:
-                        pass
-                else:
-                    logger.info(f"   🔐 先执行登录: {login_url}")
-                    page.goto(login_url, timeout=PAGE_LOAD_TIMEOUT)
-                    try:
-                        page.wait_for_load_state("networkidle", timeout=15000)
-                    except Exception:
-                        try:
-                            page.wait_for_load_state("domcontentloaded", timeout=10000)
-                        except Exception:
-                            pass
-                    page.wait_for_timeout(2000)
-                    _perform_login(page, username, password, username_selector,
-                                  password_selector, submit_selector)
-                    page.wait_for_timeout(3000)
-
-            if not same_page_login:
+            if same_page_login:
+                logger.info(f"   🔐 登录URL与目标URL相同，在同一页面执行登录")
                 page.goto(url, timeout=PAGE_LOAD_TIMEOUT)
                 try:
-                    page.wait_for_load_state("networkidle", timeout=15000)
+                    page.wait_for_load_state("networkidle", timeout=WAIT_NETWORKIDLE_TIMEOUT)
                 except Exception:
                     try:
-                        page.wait_for_load_state("domcontentloaded", timeout=10000)
+                        page.wait_for_load_state("domcontentloaded", timeout=WAIT_DOMCONTENTLOADED_TIMEOUT)
                     except Exception:
                         pass
-                page.wait_for_timeout(2000)
+                page.wait_for_timeout(WAIT_EXTRA_TIMEOUT)
+                _perform_login(page, username, password, username_selector,
+                              password_selector, submit_selector)
+                page.wait_for_timeout(3000)
+                try:
+                    page.wait_for_load_state("networkidle", timeout=10000)
+                except Exception:
+                    pass
+            else:
+                logger.info(f"   🔐 先执行登录: {login_url}")
+                page.goto(login_url, timeout=PAGE_LOAD_TIMEOUT)
+                try:
+                    page.wait_for_load_state("networkidle", timeout=WAIT_NETWORKIDLE_TIMEOUT)
+                except Exception:
+                    try:
+                        page.wait_for_load_state("domcontentloaded", timeout=WAIT_DOMCONTENTLOADED_TIMEOUT)
+                    except Exception:
+                        pass
+                page.wait_for_timeout(WAIT_EXTRA_TIMEOUT)
+                _perform_login(page, username, password, username_selector,
+                              password_selector, submit_selector)
+                page.wait_for_timeout(3000)
 
-            title = page.title()
+        if not same_page_login:
+            page.goto(url, timeout=PAGE_LOAD_TIMEOUT)
+            try:
+                page.wait_for_load_state("networkidle", timeout=WAIT_NETWORKIDLE_TIMEOUT)
+            except Exception:
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=WAIT_DOMCONTENTLOADED_TIMEOUT)
+                except Exception:
+                    pass
+            page.wait_for_timeout(WAIT_EXTRA_TIMEOUT)
 
-            elements_data = page.evaluate("""() => {
-                const results = {
-                    buttons: [],
-                    inputs: [],
-                    selects: [],
-                    links: [],
-                    tabs: [],
-                    menus: [],
-                    tables: [],
-                    forms: [],
-                    modals: [],
-                    pageTitle: document.title
-                };
+        title = page.title()
 
-                document.querySelectorAll('button, [role="button"], a.btn, .ant-btn, .el-button').forEach(el => {
-                    const text = (el.textContent || '').trim().slice(0, 50);
-                    const id = el.id || '';
-                    const cls = (el.className || '').slice(0, 100);
-                    if (text && !text.startsWith('<')) {
-                        results.buttons.push({text, id, cls, tag: el.tagName});
-                    }
-                });
+        elements_data = page.evaluate("""() => {
+            const results = {
+                buttons: [],
+                inputs: [],
+                selects: [],
+                links: [],
+                tabs: [],
+                menus: [],
+                tables: [],
+                forms: [],
+                modals: [],
+                pageTitle: document.title
+            };
 
-                document.querySelectorAll('input:not([type="hidden"]), textarea').forEach(el => {
-                    const placeholder = el.placeholder || '';
-                    const name = el.name || '';
-                    const id = el.id || '';
-                    const type = el.type || 'text';
-                    const label = (el.closest('.ant-form-item, .el-form-item, .form-group, .field')?.querySelector('label')?.textContent || '').trim();
-                    results.inputs.push({placeholder, name, id, type, label});
-                });
+            document.querySelectorAll('button, [role="button"], a.btn, .ant-btn, .el-button').forEach(el => {
+                const text = (el.textContent || '').trim().slice(0, 50);
+                const id = el.id || '';
+                const cls = (el.className || '').slice(0, 100);
+                if (text && !text.startsWith('<')) {
+                    results.buttons.push({text, id, cls, tag: el.tagName});
+                }
+            });
 
-                document.querySelectorAll('.ant-select, .el-select, select').forEach(el => {
-                    const label = (el.closest('.ant-form-item, .el-form-item, .form-group, .field')?.querySelector('label')?.textContent || '').trim();
-                    const id = el.id || '';
-                    results.selects.push({label, id});
-                });
+            document.querySelectorAll('input:not([type="hidden"]), textarea').forEach(el => {
+                const placeholder = el.placeholder || '';
+                const name = el.name || '';
+                const id = el.id || '';
+                const type = el.type || 'text';
+                const label = (el.closest('.ant-form-item, .el-form-item, .form-group, .field')?.querySelector('label')?.textContent || '').trim();
+                results.inputs.push({placeholder, name, id, type, label});
+            });
 
-                document.querySelectorAll('a[href]:not([href="#"]):not([href=""]), .ant-menu-item, .el-menu-item, [class*="menu-item"]').forEach(el => {
-                    const text = (el.textContent || '').trim().slice(0, 50);
-                    const href = el.href || '';
-                    if (text) results.links.push({text, href});
-                });
+            document.querySelectorAll('.ant-select, .el-select, select').forEach(el => {
+                const label = (el.closest('.ant-form-item, .el-form-item, .form-group, .field')?.querySelector('label')?.textContent || '').trim();
+                const id = el.id || '';
+                results.selects.push({label, id});
+            });
 
-                document.querySelectorAll('.ant-tabs-tab, .el-tabs__item, [role="tab"]').forEach(el => {
-                    const text = (el.textContent || '').trim().slice(0, 30);
-                    if (text) results.tabs.push({text});
-                });
+            document.querySelectorAll('a[href]:not([href="#"]):not([href=""]), .ant-menu-item, .el-menu-item, [class*="menu-item"]').forEach(el => {
+                const text = (el.textContent || '').trim().slice(0, 50);
+                const href = el.href || '';
+                if (text) results.links.push({text, href});
+            });
 
-                document.querySelectorAll('.ant-menu, .el-menu, [class*="sidebar"], [class*="side-menu"], nav[class*="menu"]').forEach(el => {
-                    const items = Array.from(el.querySelectorAll('.ant-menu-item, .el-menu-item, li, [class*="menu-item"]'))
-                        .map(i => (i.textContent || '').trim().slice(0, 50))
-                        .filter(t => t);
-                    if (items.length > 0) results.menus.push({items});
-                });
+            document.querySelectorAll('.ant-tabs-tab, .el-tabs__item, [role="tab"]').forEach(el => {
+                const text = (el.textContent || '').trim().slice(0, 30);
+                if (text) results.tabs.push({text});
+            });
 
-                document.querySelectorAll('table, .ant-table, .el-table').forEach(el => {
-                    const headers = Array.from(el.querySelectorAll('th'))
-                        .map(th => (th.textContent || '').trim())
-                        .filter(t => t);
-                    const rowCount = el.querySelectorAll('tbody tr').length;
-                    if (headers.length > 0) results.tables.push({headers, rowCount});
-                });
+            document.querySelectorAll('.ant-menu, .el-menu, [class*="sidebar"], [class*="side-menu"], nav[class*="menu"]').forEach(el => {
+                const items = Array.from(el.querySelectorAll('.ant-menu-item, .el-menu-item, li, [class*="menu-item"]'))
+                    .map(i => (i.textContent || '').trim().slice(0, 50))
+                    .filter(t => t);
+                if (items.length > 0) results.menus.push({items});
+            });
 
-                document.querySelectorAll('form, .ant-form, .el-form').forEach(el => {
-                    const inputs = el.querySelectorAll('input:not([type="hidden"]), textarea, select').length;
-                    const buttons = el.querySelectorAll('button, [role="button"]').length;
-                    if (inputs > 0) results.forms.push({inputs, buttons});
-                });
+            document.querySelectorAll('table, .ant-table, .el-table').forEach(el => {
+                const headers = Array.from(el.querySelectorAll('th'))
+                    .map(th => (th.textContent || '').trim())
+                    .filter(t => t);
+                const rowCount = el.querySelectorAll('tbody tr').length;
+                if (headers.length > 0) results.tables.push({headers, rowCount});
+            });
 
-                document.querySelectorAll('.ant-modal, .el-dialog, [role="dialog"], .modal').forEach(el => {
-                    const visible = el.offsetParent !== null;
-                    const title = (el.querySelector('.ant-modal-title, .el-dialog__title, .modal-title')?.textContent || '').trim();
-                    if (title) results.modals.push({title, visible});
-                });
+            document.querySelectorAll('form, .ant-form, .el-form').forEach(el => {
+                const inputs = el.querySelectorAll('input:not([type="hidden"]), textarea, select').length;
+                const buttons = el.querySelectorAll('button, [role="button"]').length;
+                if (inputs > 0) results.forms.push({inputs, buttons});
+            });
 
-                return results;
-            }""")
+            document.querySelectorAll('.ant-modal, .el-dialog, [role="dialog"], .modal').forEach(el => {
+                const visible = el.offsetParent !== null;
+                const title = (el.querySelector('.ant-modal-title, .el-dialog__title, .modal-title')?.textContent || '').trim();
+                if (title) results.modals.push({title, visible});
+            });
 
-            logger.info(f"   📊 发现: {len(elements_data.get('buttons',[]))}按钮, "
-                       f"{len(elements_data.get('inputs',[]))}输入框, "
-                       f"{len(elements_data.get('selects',[]))}下拉框, "
-                       f"{len(elements_data.get('tables',[]))}表格, "
-                       f"{len(elements_data.get('forms',[]))}表单, "
-                       f"{len(elements_data.get('menus',[]))}菜单")
-            return {"url": url, "title": title, "elements": elements_data}
-        finally:
-            browser.close()
+            return results;
+        }""")
+
+        logger.info(f"   📊 发现: {len(elements_data.get('buttons',[]))}按钮, "
+                   f"{len(elements_data.get('inputs',[]))}输入框, "
+                   f"{len(elements_data.get('selects',[]))}下拉框, "
+                   f"{len(elements_data.get('tables',[]))}表格, "
+                   f"{len(elements_data.get('forms',[]))}表单, "
+                   f"{len(elements_data.get('menus',[]))}菜单")
+        return {"url": url, "title": title, "elements": elements_data}
+    finally:
+        _browser_cleanup(p, browser, page)
 
 
 def _find_login_frame(page, require_password=False):
@@ -2059,6 +3864,20 @@ def _extract_frame_info(frame) -> str:
         return ""
 
 
+def _detect_and_use_login_frame(page, page_info: str):
+    """检测登录iframe并提取信息，返回 (login_frame, updated_page_info, opened)"""
+    login_frame = _find_login_frame(page)
+    if login_frame:
+        logger.info("   ✅ 检测到登录表单在iframe中")
+        frame_info = _extract_frame_info(login_frame)
+        if frame_info:
+            page_info = frame_info
+            page_info += "\n\n【重要提示】登录表单在iframe中，系统会自动在iframe中执行操作。不要再次点击页面上的登录入口按钮，直接在登录表单内操作即可。"
+            logger.info(f"   📊 iframe页面信息: {len(page_info)} 字符")
+        return login_frame, page_info, True
+    return None, page_info, False
+
+
 def _perform_login(page, username: str, password: str, username_selector: str = "",
                    password_selector: str = "", submit_selector: str = ""):
     """在页面上执行登录操作，AI智能识别页面内容并自主完成登录流程"""
@@ -2083,16 +3902,9 @@ def _perform_login(page, username: str, password: str, username_selector: str = 
     login_dialog_opened = False
 
     if not has_login_form:
-        login_frame = _find_login_frame(page)
+        login_frame, page_info, login_dialog_opened = _detect_and_use_login_frame(page, page_info)
         if login_frame:
-            logger.info("   ✅ 检测到登录表单在iframe中")
             has_login_form = True
-            login_dialog_opened = True
-            frame_info = _extract_frame_info(login_frame)
-            if frame_info:
-                page_info = frame_info
-                page_info += "\n\n【重要提示】登录表单在iframe中，系统会自动在iframe中执行操作。不要再次点击页面上的登录入口按钮，直接在登录表单内操作即可。"
-                logger.info(f"   📊 iframe页面信息: {len(page_info)} 字符")
         else:
             logger.info("   🔍 未检测到登录表单，尝试点击登录按钮打开登录弹窗...")
             clicked = _try_click_login_entry(page)
@@ -2103,16 +3915,7 @@ def _perform_login(page, username: str, password: str, username_selector: str = 
                 except Exception:
                     pass
 
-                login_frame = _find_login_frame(page)
-                if login_frame:
-                    logger.info("   ✅ 点击后检测到登录表单在iframe中")
-                    login_dialog_opened = True
-                    frame_info = _extract_frame_info(login_frame)
-                    if frame_info:
-                        page_info = frame_info
-                        page_info += "\n\n【重要提示】登录表单在iframe中，系统会自动在iframe中执行操作。不要再次点击页面上的登录入口按钮，直接在登录表单内操作即可。"
-                        logger.info(f"   📊 iframe页面信息: {len(page_info)} 字符")
-
+                login_frame, page_info, login_dialog_opened = _detect_and_use_login_frame(page, page_info)
                 if not login_frame:
                     try:
                         page.wait_for_selector('input[type="text"], input[type="tel"], input[type="password"], input[placeholder*="手机"], input[placeholder*="账号"], input[placeholder*="用户"]', timeout=5000)
@@ -2122,14 +3925,8 @@ def _perform_login(page, username: str, password: str, username_selector: str = 
                         pass
 
                     if not login_dialog_opened:
-                        login_frame = _find_login_frame(page)
-                        if login_frame:
-                            login_dialog_opened = True
-                            frame_info = _extract_frame_info(login_frame)
-                            if frame_info:
-                                page_info = frame_info
-                                page_info += "\n\n【重要提示】登录表单在iframe中，系统会自动在iframe中执行操作。不要再次点击页面上的登录入口按钮，直接在登录表单内操作即可。"
-                        elif _page_has_login_form(page):
+                        login_frame, page_info, login_dialog_opened = _detect_and_use_login_frame(page, page_info)
+                        if not login_dialog_opened and _page_has_login_form(page):
                             login_dialog_opened = True
                             logger.info("   ✅ 登录弹窗已打开（延迟检测）")
 
@@ -2139,22 +3936,12 @@ def _perform_login(page, username: str, password: str, username_selector: str = 
                         logger.info(f"   📊 弹窗后页面信息: {len(page_info)} 字符")
 
                 if not login_dialog_opened:
-                    logger.info("   🔄 弹窗可能未正确打开，尝试更广泛的选择器...")
-                    _try_open_login_dialog_advanced(page)
-                    page.wait_for_timeout(3000)
-                    login_frame = _find_login_frame(page)
-                    if login_frame:
+                    page_info_new = _extract_login_page_info(page)
+                    if page_info_new and len(page_info_new) > len(page_info):
+                        page_info = page_info_new
+                    if _page_has_login_form(page):
                         login_dialog_opened = True
-                        frame_info = _extract_frame_info(login_frame)
-                        if frame_info:
-                            page_info = frame_info
-                            page_info += "\n\n【重要提示】登录表单在iframe中，系统会自动在iframe中执行操作。不要再次点击页面上的登录入口按钮，直接在登录表单内操作即可。"
-                    else:
-                        page_info_new = _extract_login_page_info(page)
-                        if page_info_new and len(page_info_new) > len(page_info):
-                            page_info = page_info_new
-                        if _page_has_login_form(page):
-                            login_dialog_opened = True
+                        logger.info("   ✅ 登录弹窗已打开（延迟检测）")
 
     if login_dialog_opened and not login_frame:
         page_info = _extract_login_page_info(page)
@@ -2207,6 +3994,92 @@ def _perform_login(page, username: str, password: str, username_selector: str = 
                             logger.info(f"   📊 iframe内容已更新: {len(new_info)} 字符")
                     except Exception:
                         pass
+
+                # 检测并关闭确认弹窗（如"点击确定表示同意协议"、"登录成功提示"等）
+                page.wait_for_timeout(500)
+                try:
+                    target = login_frame if login_frame else page
+                    dialog_result = target.evaluate("""() => {
+                        // 检测弹窗容器
+                        const dialogSelectors = [
+                            '.ant-modal', '.el-dialog', '[role="dialog"]', '[role="alertdialog"]',
+                            '.modal', '.dialog', '.toast', '.popup', '.confirm',
+                            '[class*="modal"]', '[class*="dialog"]', '[class*="popup"]',
+                            '[class*="toast"]', '[class*="confirm"]', '[class*="notification"]'
+                        ];
+                        for (const sel of dialogSelectors) {
+                            try {
+                                const dialog = document.querySelector(sel);
+                                if (dialog) {
+                                    const style = window.getComputedStyle(dialog);
+                                    if (style.display !== 'none' && style.visibility !== 'hidden') {
+                                        const text = (dialog.textContent || '').slice(0, 300);
+                                        // 查找确认按钮
+                                        const btnTexts = ['确定', '确认', 'OK', '我知道了', '知道了', '同意'];
+                                        const buttons = [];
+                                        dialog.querySelectorAll('button, [role="button"], a.btn, span[class*="btn"], div[class*="btn"]').forEach(btn => {
+                                            const t = (btn.textContent || '').trim();
+                                            const s = window.getComputedStyle(btn);
+                                            if (s.display === 'none' || s.visibility === 'hidden') return;
+                                            if (btnTexts.some(b => t.includes(b))) {
+                                                buttons.push({text: t, tag: btn.tagName, cls: (btn.className || '').slice(0, 60)});
+                                            }
+                                        });
+                                        if (buttons.length > 0) {
+                                            return {found: true, type: 'dialog_container', selector: sel, text: text.slice(0, 150), buttons};
+                                        }
+                                    }
+                                }
+                            } catch(e) {}
+                        }
+                        // 直接搜索页面上的确认按钮
+                        const btnTexts = ['确定', '确认', 'OK', '我知道了', '知道了', '同意'];
+                        const allBtns = [];
+                        document.querySelectorAll('button, [role="button"]').forEach(btn => {
+                            const t = (btn.textContent || '').trim();
+                            const s = window.getComputedStyle(btn);
+                            if (s.display === 'none' || s.visibility === 'hidden') return;
+                            if (btnTexts.some(b => t === b || t.startsWith(b))) {
+                                allBtns.push({text: t, tag: btn.tagName, cls: (btn.className || '').slice(0, 60)});
+                            }
+                        });
+                        if (allBtns.length > 0) {
+                            return {found: true, type: 'standalone', buttons: allBtns};
+                        }
+                        return {found: false};
+                    }""")
+                    if dialog_result.get('found'):
+                        logger.info(f"   💡 检测到确认弹窗: {dialog_result.get('text', '')}")
+                        for btn_info in dialog_result.get('buttons', [])[:1]:
+                            btn_text = btn_info.get('text', '')
+                            logger.info(f"   👆 自动点击弹窗按钮: '{btn_text}'")
+                            try:
+                                target.locator(f'button:has-text("{btn_text}"), [role="button"]:has-text("{btn_text}")').first.click(timeout=3000)
+                            except Exception:
+                                try:
+                                    target.locator(f'text="{btn_text}"').first.click(timeout=3000)
+                                except Exception:
+                                    try:
+                                        target.evaluate(f"""() => {{
+                                            const btns = document.querySelectorAll('button, [role="button"]');
+                                            for (const btn of btns) {{
+                                                if (btn.textContent.trim() === '{btn_text}') {{
+                                                    btn.click();
+                                                    btn.dispatchEvent(new MouseEvent('click', {{bubbles: true, cancelable: true, composed: true}}));
+                                                    return true;
+                                                }}
+                                            }}
+                                            return false;
+                                        }}""")
+                                    except Exception:
+                                        pass
+                            page.wait_for_timeout(1000)
+                            try:
+                                target.wait_for_load_state("domcontentloaded", timeout=5000)
+                            except Exception:
+                                pass
+                except Exception as e:
+                    logger.info(f"   ⚡ 弹窗检测异常: {e}")
 
             if i < len(actions) - 1:
                 try:
@@ -2411,47 +4284,24 @@ def _close_blocking_modals(page):
 
 
 def _try_click_login_entry(page) -> bool:
-    """尝试点击页面上的登录入口按钮（打开登录弹窗）"""
-    entry_selectors = [
-        'a:has-text("登录")',
-        'button:has-text("登录")',
-        'text=登录',
-        'span:has-text("登录")',
-        'div:has-text("登录")',
-        '[class*="login"]',
-        'a:has-text("Login")',
-        'button:has-text("Login")',
-    ]
-    for sel in entry_selectors:
-        try:
-            loc = page.locator(sel).first
-            if loc.count() > 0:
-                loc.click()
-                page.wait_for_timeout(1000)
-                logger.info(f"   ✅ 点击登录入口: {sel}")
-                return True
-        except Exception:
-            continue
-    logger.warning("   ⚠️ 未找到登录入口按钮")
-    return False
-
-
-def _try_open_login_dialog_advanced(page):
-    """更高级的登录弹窗打开策略：尝试点击更广泛的选择器，处理iframe等"""
-    advanced_selectors = [
+    """尝试点击页面上的登录入口按钮（打开登录弹窗），包含多级回退策略"""
+    all_selectors = [
+        'a:has-text("登录")', 'button:has-text("登录")', 'text=登录',
+        'span:has-text("登录")', 'div:has-text("登录")', '[class*="login"]',
+        'a:has-text("Login")', 'button:has-text("Login")',
         '[class*="signin"]', '[class*="sign-in"]', '[class*="login-btn"]',
         '[class*="loginBtn"]', '[class*="login_button"]',
         'a[href*="login"]', 'a[href*="signin"]',
         '[data-action="login"]', '[data-type="login"]',
     ]
-    for sel in advanced_selectors:
+    for sel in all_selectors:
         try:
             loc = page.locator(sel).first
             if loc.count() > 0:
                 loc.click()
                 page.wait_for_timeout(1500)
-                logger.info(f"   ✅ 高级选择器点击: {sel}")
-                return
+                logger.info(f"   ✅ 点击登录入口: {sel}")
+                return True
         except Exception:
             continue
 
@@ -2466,11 +4316,14 @@ def _try_open_login_dialog_advanced(page):
                         login_link.click()
                         page.wait_for_timeout(2000)
                         logger.info("   ✅ 在iframe中点击登录入口")
-                        return
+                        return True
                 except Exception:
                     continue
     except Exception:
         pass
+
+    logger.warning("   ⚠️ 未找到登录入口按钮")
+    return False
 
 
 def _extract_login_page_info(page) -> str:
@@ -3739,11 +5592,11 @@ LOGIN_PAGE_ANALYZE_PROMPT = """
 
 
 EXPLORATORY_CASE_PROMPT = """
-你是一名资深测试专家，需要根据页面探索结果（可交互元素列表），生成自动化测试用例集。
+你是一名资深测试专家，需要根据页面探索结果（可交互元素列表），生成功能测试用例集。
 
 【核心任务】
 你拿到的是一个Web页面的全部可交互元素清单（按钮、输入框、下拉框、链接、表格、表单、菜单等）。
-请推断出该页面的业务流程，并为每个流程生成测试用例。
+请推断出该页面的业务流程，并为每个流程生成功能测试用例。
 
 【覆盖要求】
 1. 每个功能点生成1条正向用例 + 1-2条关键异常用例
@@ -3752,19 +5605,14 @@ EXPLORATORY_CASE_PROMPT = """
 
 【用例字段规范】
 - id：TC-{模块缩写}-{3位序号}，如 TC-ORDER-001
-- name：用例名称（简洁）
-- preconditions：前置条件（一句话）
-- steps：Playwright格式步骤（action/selector/value/description）
-  选择器要使用从元素列表中提取的真实属性（placeholder、id、文本等）
-- expected_result：预期结果（一句话）
+- name：用例名称（如"正向-创建订单"、"异常-必填项为空无法提交"）
+- module：所属功能模块名称
+- priority：优先级，P0/P1/P2/P3
+- preconditions：前置条件
+- test_steps：测试步骤，字符串数组，每步是清晰的中文操作描述
+- expected_result：预期结果
+- test_data：测试数据
 - scenario_type：正向流程 / 异常操作 / 边界条件
-
-【步骤选择器生成规则】
-- 按钮：text=按钮文字
-- 输入框：placeholder或id
-- 下拉框：text=选项文字
-- 链接/菜单：text=链接文字
-- 表单验证：assert_text
 
 【输出要求】
 返回纯JSON数组，不要额外解释，不要markdown代码块。确保JSON格式完整有效。
@@ -3812,22 +5660,502 @@ def ai_generate_exploratory_cases(url: str, login_url: str = "", username: str =
         for case in test_cases:
             if not case.get("name"):
                 continue
-            steps = case.get("steps", [])
-            valid_steps = []
-            for step in steps:
-                if not step.get("action") or not step.get("selector"):
-                    continue
-                if step.get("action") not in ("fill", "click", "wait_for_selector", "assert_text"):
-                    continue
-                if step.get("action") in ("fill", "assert_text") and not step.get("value"):
-                    continue
-                valid_steps.append(step)
-            case["steps"] = valid_steps if valid_steps else steps
+            test_steps = case.get("test_steps", case.get("steps", []))
+            if isinstance(test_steps, str):
+                test_steps = [test_steps]
+            if not test_steps:
+                continue
+            case["steps"] = test_steps
             case["url"] = url
             case["test_type"] = "web"
+            if "test_steps" not in case:
+                case["test_steps"] = test_steps
+            if "module" not in case:
+                case["module"] = ""
+            if "priority" not in case:
+                case["priority"] = "P1"
+            if "test_data" not in case:
+                case["test_data"] = ""
             valid_cases.append(case)
-        logger.info(f"✅ 探索性生成{len(valid_cases)}个用例")
+        logger.info(f"✅ 探索性生成{len(valid_cases)}个功能测试用例")
         return valid_cases
     except Exception as e:
         logger.error(f"❌ 探索性生成失败: {e}", exc_info=True)
         raise
+
+
+# ======================== 【新增】核心函数异步版本 ========================
+# 以下为同步函数的异步包装版本，用于WebSocket/异步场景中避免事件循环阻塞
+# 原有同步函数完全保留不动，异步版本作为增量补充
+
+
+async def async_capture_page_context(url: str) -> Tuple[str, str, str]:
+    """【新增】异步版本的页面内容捕获（打开浏览器、访问URL、截图、提取DOM）"""
+    from playwright.async_api import async_playwright
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context(viewport=VIEWPORT)
+        page = await context.new_page()
+        try:
+            await page.goto(url, timeout=PAGE_LOAD_TIMEOUT)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=WAIT_NETWORKIDLE_TIMEOUT)
+            except Exception:
+                try:
+                    await page.wait_for_load_state("domcontentloaded", timeout=WAIT_DOMCONTENTLOADED_TIMEOUT)
+                except Exception:
+                    pass
+            await page.wait_for_timeout(WAIT_EXTRA_TIMEOUT)
+            title = await page.title()
+            html = await page.content()
+            html = html[:MAX_HTML_LENGTH]
+            screenshot = await page.screenshot(full_page=True, type="png")
+            screenshot_b64 = base64.b64encode(screenshot).decode("utf-8")
+            return title, html, screenshot_b64
+        finally:
+            await browser.close()
+
+
+@retry_api_call
+async def ai_generate_locator_async(url: str, element_description: str) -> str:
+    """【新增】异步版本：ai_generate_locator"""
+    logger.info(f"🔍 [异步] 生成定位器: {element_description}")
+    try:
+        title, dom, screenshot_b64 = await async_capture_page_context(url)
+        response = await async_client.chat.completions.create(
+            model=AI_MODEL,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT_COMMON},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": f"页面标题：{title}\n定位元素：{element_description}\nDOM片段：\n{dom}"},
+                        {"type": "image_url", "image_url": {
+                            "url": f"data:image/png;base64,{screenshot_b64}",
+                            "detail": "high"
+                        }}
+                    ]
+                }
+            ],
+            max_tokens=300,
+            temperature=0,
+            timeout=AI_REQUEST_TIMEOUT
+        )
+        selector_str = response.choices[0].message.content.strip()
+        logger.info(f"   AI返回原始选择器: {selector_str}")
+        valid_selectors = validate_locators_on_page(url, selector_str)
+        if valid_selectors:
+            return valid_selectors[0]
+        fallback = clean_selector(_split_selectors(selector_str)[0])
+        logger.warning(f"   ⚠️ 所有选择器均无效，使用降级: {fallback}")
+        return fallback
+    except Exception as e:
+        logger.error(f"❌ [异步] 生成定位器失败: {e}", exc_info=True)
+        raise
+
+
+@retry_api_call
+async def ai_relocate_from_current_page_async(page: AsyncPage, element_desc: str) -> str:
+    """【新增】异步版本：ai_relocate_from_current_page"""
+    logger.info("🤖 [异步] 触发AI实时重定位...")
+    try:
+        dom, screenshot_b64 = await capture_current_page_context_async(page)
+        response = await async_client.chat.completions.create(
+            model=AI_MODEL,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT_COMMON},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": f"重新定位元素：{element_desc}\n当前DOM片段：\n{dom}"},
+                        {"type": "image_url", "image_url": {
+                            "url": f"data:image/png;base64,{screenshot_b64}",
+                            "detail": "high"
+                        }}
+                    ]
+                }
+            ],
+            max_tokens=200,
+            temperature=0,
+            timeout=AI_REQUEST_TIMEOUT
+        )
+        new_selector = response.choices[0].message.content.strip()
+        new_selector = clean_selector(new_selector)
+        valid_selectors = []
+        for sel in _split_selectors(new_selector):
+            sel = clean_selector(sel.strip())
+            if not sel:
+                continue
+            try:
+                locator = page.locator(sel)
+                count = await locator.count()
+                if count == 1:
+                    valid_selectors.append(sel)
+                    logger.info(f"   ✅ 重定位验证通过: {sel}")
+                elif count > 1:
+                    logger.warning(f"   ⚠️ 重定位匹配{count}个: {sel}")
+            except Exception as e:
+                logger.warning(f"   ⚠️ 重定位无效: {sel} -> {e}")
+        final_selector = clean_selector(valid_selectors[0]) if valid_selectors else clean_selector(_split_selectors(new_selector)[0].strip())
+        if not final_selector:
+            raise Exception("AI重定位返回空选择器")
+        logger.info(f"✅ [异步] 重定位成功，最终选择器：{final_selector}")
+        return final_selector
+    except Exception as e:
+        logger.error(f"❌ [异步] 重定位失败: {e}")
+        raise
+
+
+@retry_api_call
+async def ai_generate_test_steps_async(url: str, requirement: str) -> List[Dict]:
+    """【新增】异步版本：ai_generate_test_steps"""
+    logger.info(f"🤖 [异步] 生成测试步骤: {requirement[:100]}...")
+    try:
+        title, dom, _ = await async_capture_page_context(url)
+        response = await async_client.chat.completions.create(
+            model=AI_MODEL,
+            messages=[
+                {"role": "system", "content": STEP_GENERATION_PROMPT},
+                {
+                    "role": "user",
+                    "content": (
+                        f"页面标题：{title}\n"
+                        f"页面URL：{url}\n"
+                        f"操作需求：{requirement}\n"
+                        f"请生成完整的自动化测试步骤，包括所有必要的中间操作和最终验证。\n"
+                        f"页面DOM片段（供参考选择器）：\n{dom}"
+                    )
+                }
+            ],
+            max_tokens=2500,
+            temperature=0.1,
+            timeout=AI_REQUEST_TIMEOUT
+        )
+        ai_text = response.choices[0].message.content.strip()
+        steps = extract_json_from_response(ai_text)
+        if isinstance(steps, dict):
+            steps = steps.get("steps", [])
+        valid_steps = []
+        for s in steps:
+            if not isinstance(s, dict):
+                continue
+            action = s.get("action")
+            selector = s.get("selector")
+            value = s.get("value")
+            desc = s.get("description", "")
+            if not action or not selector:
+                continue
+            if action not in ("fill", "click", "wait_for_selector", "assert_text"):
+                continue
+            if action in ("fill", "assert_text") and not value:
+                if action == "assert_text":
+                    logger.warning(f"   ⚠️ assert_text缺少期望值，已跳过: {desc}")
+                    continue
+            valid_steps.append({
+                "action": action,
+                "selector": selector,
+                "value": value or "",
+                "description": desc
+            })
+        logger.info(f"✅ [异步] 生成{len(valid_steps)}个有效步骤")
+        return valid_steps
+    except Exception as e:
+        logger.error(f"❌ [异步] 生成步骤失败: {e}", exc_info=True)
+        raise
+
+
+@retry_api_call
+async def ai_generate_comprehensive_test_cases_async(url: str, requirement: str) -> List[Dict]:
+    """【新增】异步版本：ai_generate_comprehensive_test_cases"""
+    logger.info(f"🤖 [异步] 生成多场景用例: {requirement[:100]}...")
+    try:
+        title, dom, _ = await async_capture_page_context(url)
+        response = await async_client.chat.completions.create(
+            model=AI_MODEL,
+            messages=[
+                {"role": "system", "content": COMPREHENSIVE_TEST_CASE_PROMPT},
+                {
+                    "role": "user",
+                    "content": (
+                        f"页面标题：{title}\n"
+                        f"页面URL：{url}\n"
+                        f"业务需求：{requirement}\n"
+                        f"页面DOM片段（供参考选择器）：\n{dom}"
+                    )
+                }
+            ],
+            max_tokens=3500,
+            temperature=0.1,
+            timeout=AI_REQUEST_TIMEOUT
+        )
+        ai_text = response.choices[0].message.content.strip()
+        test_cases = extract_json_from_response(ai_text)
+        if isinstance(test_cases, dict):
+            test_cases = test_cases.get("test_cases", [])
+        valid_cases = []
+        for case in test_cases:
+            if not case.get("name"):
+                continue
+            test_steps = case.get("test_steps", case.get("steps", []))
+            if isinstance(test_steps, str):
+                test_steps = [test_steps]
+            if not test_steps:
+                continue
+            case["steps"] = test_steps
+            case["url"] = url
+            case["test_type"] = "web"
+            if "test_steps" not in case:
+                case["test_steps"] = test_steps
+            if "module" not in case:
+                case["module"] = ""
+            if "priority" not in case:
+                case["priority"] = "P1"
+            if "test_data" not in case:
+                case["test_data"] = ""
+            valid_cases.append(case)
+        logger.info(f"✅ [异步] 成功生成{len(valid_cases)}个功能测试用例")
+        return valid_cases
+    except Exception as e:
+        logger.error(f"❌ [异步] 生成多场景测试用例失败: {e}", exc_info=True)
+        raise
+
+
+@retry_api_call
+async def analyze_requirement_async(document_content: str) -> Dict:
+    """【新增】异步版本：analyze_requirement"""
+    logger.info(f"📊 [异步] 开始需求分析: 文档长度={len(document_content)}")
+    try:
+        content_to_analyze = document_content[:50000] if len(document_content) > 50000 else document_content
+        if len(document_content) > 50000:
+            logger.info(f"📊 文档过长({len(document_content)}字符)，截取前50000字符分析")
+
+        response = await async_client.chat.completions.create(
+            model=AI_MODEL,
+            messages=[
+                {"role": "system", "content": REQUIREMENT_ANALYSIS_PROMPT},
+                {"role": "user", "content": content_to_analyze}
+            ],
+            max_tokens=16000,
+            temperature=0.2,
+            timeout=AI_REQUEST_TIMEOUT
+        )
+        ai_text = response.choices[0].message.content.strip()
+        result = extract_json_from_response(ai_text)
+        logger.info(f"✅ [异步] 需求分析完成: {len(str(result))} 字符")
+        return result
+    except Exception as e:
+        logger.error(f"❌ [异步] 需求分析失败: {e}")
+        raise
+
+
+@retry_api_call
+async def ai_generate_cases_from_document_async(document_text: str, doc_type: str = "prd", url: str = "") -> List[Dict]:
+    """【新增】异步版本：ai_generate_cases_from_document"""
+    logger.info(f"📄 [异步] 从文档生成用例: {doc_type}, 文档长度={len(document_text)}...")
+
+    MAX_INPUT = 60000
+    content = document_text[:MAX_INPUT] if len(document_text) > MAX_INPUT else document_text
+    if len(document_text) > MAX_INPUT:
+        logger.info(f"📄 文档过长({len(document_text)}字符)，截取前{MAX_INPUT}字符")
+
+    try:
+        response = await async_client.chat.completions.create(
+            model=AI_MODEL,
+            messages=[
+                {"role": "system", "content": DOCUMENT_PARSE_PROMPT},
+                {
+                    "role": "user",
+                    "content": (
+                        f"文档类型：{doc_type}（prd=需求文档, user_story=用户故事, api_doc=接口文档, web_prototype=网页原型）\n"
+                        f"目标URL（如有）：{url}\n"
+                        f"以下是从网页原型中提取的混合内容（包含需求描述和UI文本），请先过滤噪音再生成用例：\n\n{content}"
+                    )
+                }
+            ],
+            max_tokens=16000,
+            temperature=0.1,
+            timeout=AI_REQUEST_TIMEOUT
+        )
+        ai_text = response.choices[0].message.content.strip()
+        logger.info(f"📄 [异步] AI返回内容长度: {len(ai_text)} 字符")
+
+        test_cases = extract_json_from_response(ai_text)
+        if isinstance(test_cases, dict):
+            test_cases = test_cases.get("test_cases", [])
+
+        valid_cases = []
+        for case in test_cases:
+            if not case.get("name"):
+                continue
+            test_steps = case.get("test_steps", case.get("steps", []))
+            if isinstance(test_steps, str):
+                try:
+                    test_steps = json.loads(test_steps)
+                except (json.JSONDecodeError, TypeError):
+                    test_steps = [test_steps]
+            if not test_steps:
+                continue
+            case["steps"] = test_steps
+            case["url"] = url
+            case["test_type"] = "web"
+            if "test_steps" not in case:
+                case["test_steps"] = test_steps
+            if "module" not in case:
+                case["module"] = ""
+            if "priority" not in case:
+                case["priority"] = "P1"
+            if "test_data" not in case:
+                case["test_data"] = ""
+            valid_cases.append(case)
+
+        logger.info(f"✅ [异步] 从文档生成 {len(valid_cases)} 个功能测试用例")
+        return valid_cases
+    except Exception as e:
+        logger.error(f"❌ [异步] 文档解析生成失败: {e}", exc_info=True)
+        raise
+
+
+@retry_api_call
+async def ai_convert_func_to_auto_steps_async(func_case_info: dict) -> List[Dict]:
+    """【新增】异步版本：ai_convert_func_to_auto_steps"""
+    steps_text = func_case_info.get("steps", "")
+    if isinstance(steps_text, list):
+        steps_text = "\n".join(steps_text)
+
+    preconditions = func_case_info.get("preconditions", "")
+    expected = func_case_info.get("expected_result", "")
+    test_data = func_case_info.get("test_data", "")
+    module = func_case_info.get("module", "")
+    name = func_case_info.get("name", "")
+
+    user_content = f"""请将以下功能测试用例转换为自动化测试步骤：
+
+用例名称：{name}
+所属模块：{module}
+前置条件：{preconditions}
+测试步骤：
+{steps_text}
+预期结果：{expected}
+测试数据：{test_data}
+
+请生成包含click/fill/wait/assert的自动化步骤JSON，确保包含验证步骤。"""
+
+    try:
+        response = await async_client.chat.completions.create(
+            model=AI_MODEL,
+            messages=[
+                {"role": "system", "content": FUNC_TO_AUTO_PROMPT},
+                {"role": "user", "content": user_content}
+            ],
+            max_tokens=2000,
+            temperature=0.1,
+            timeout=AI_REQUEST_TIMEOUT
+        )
+        ai_text = response.choices[0].message.content.strip()
+        steps = extract_json_from_response(ai_text)
+        if isinstance(steps, dict):
+            steps = steps.get("steps", [])
+
+        valid_steps = []
+        for s in steps:
+            if not isinstance(s, dict):
+                continue
+            action = s.get("action")
+            selector = s.get("selector")
+            if not action or not selector:
+                continue
+            if action not in ("fill", "click", "wait_for_selector", "assert_text"):
+                continue
+            valid_steps.append({
+                "action": action,
+                "selector": selector,
+                "value": s.get("value", ""),
+                "description": s.get("description", "")
+            })
+        logger.info(f"✅ [异步] 功能用例转换为 {len(valid_steps)} 个自动化步骤")
+        return valid_steps
+    except Exception as e:
+        logger.error(f"❌ [异步] 功能用例转换失败: {e}", exc_info=True)
+        raise
+
+
+@retry_api_call
+async def async_crawl_page_interactive_elements(url: str, login_url: str = "", username: str = "",
+                                                password: str = "", username_selector: str = "",
+                                                password_selector: str = "", submit_selector: str = "") -> Dict:
+    """【新增】异步版本的页面交互元素爬取，使用线程池避免阻塞事件循环"""
+    import asyncio
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None, crawl_page_interactive_elements,
+        url, login_url, username, password,
+        username_selector, password_selector, submit_selector
+    )
+
+
+async def ai_generate_exploratory_cases_async(url: str, login_url: str = "", username: str = "",
+                                               password: str = "", username_selector: str = "",
+                                               password_selector: str = "", submit_selector: str = "") -> List[Dict]:
+    """【新增】异步版本：ai_generate_exploratory_cases"""
+    logger.info(f"🔍 [异步] 探索性生成用例: {url}")
+    try:
+        page_data = await async_crawl_page_interactive_elements(
+            url, login_url, username, password,
+            username_selector, password_selector, submit_selector
+        )
+        elements_json = json.dumps(page_data["elements"], ensure_ascii=False, indent=2)
+
+        if len(elements_json) > 12000:
+            elements_json = elements_json[:12000]
+
+        response = await async_client.chat.completions.create(
+            model=AI_MODEL,
+            messages=[
+                {"role": "system", "content": EXPLORATORY_CASE_PROMPT},
+                {
+                    "role": "user",
+                    "content": (
+                        f"页面标题：{page_data['title']}\n"
+                        f"页面URL：{url}\n"
+                        f"可交互元素清单：\n{elements_json}\n"
+                        f"请根据以上元素清单，推断业务流程并生成测试用例。"
+                    )
+                }
+            ],
+            max_tokens=8000,
+            temperature=0.1,
+            timeout=AI_REQUEST_TIMEOUT
+        )
+        ai_text = response.choices[0].message.content.strip()
+        test_cases = extract_json_from_response(ai_text)
+        if isinstance(test_cases, dict):
+            test_cases = test_cases.get("test_cases", [])
+        valid_cases = []
+        for case in test_cases:
+            if not case.get("name"):
+                continue
+            test_steps = case.get("test_steps", case.get("steps", []))
+            if isinstance(test_steps, str):
+                test_steps = [test_steps]
+            if not test_steps:
+                continue
+            case["steps"] = test_steps
+            case["url"] = url
+            case["test_type"] = "web"
+            if "test_steps" not in case:
+                case["test_steps"] = test_steps
+            if "module" not in case:
+                case["module"] = ""
+            if "priority" not in case:
+                case["priority"] = "P1"
+            if "test_data" not in case:
+                case["test_data"] = ""
+            valid_cases.append(case)
+        logger.info(f"✅ [异步] 探索性生成{len(valid_cases)}个功能测试用例")
+        return valid_cases
+    except Exception as e:
+        logger.error(f"❌ [异步] 探索性生成失败: {e}", exc_info=True)
+        raise
+
+# ======================== 【新增结束】 ========================
